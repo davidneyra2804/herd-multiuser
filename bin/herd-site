@@ -211,7 +211,7 @@ sudo_core() {
 # ------------------------------------------------------------------ acciones
 
 cmd_link() {
-  local path="" name="" php="" https="" namespace="1" force="0"
+  local path="" name="" php="" https="" namespace="1" force="0" owner=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --name) name="$2"; shift 2 ;;
@@ -219,6 +219,7 @@ cmd_link() {
       --https) https="1"; shift ;;
       --no-namespace) namespace="0"; shift ;;
       --force) force="1"; shift ;;
+      --owner) owner="$2"; shift 2 ;;
       --*) die "opción desconocida: $1" ;;
       *) [ -z "$path" ] && path="$1" || die "sólo se admite una ruta"; shift ;;
     esac
@@ -264,6 +265,12 @@ cmd_link() {
 
   local args=(link --path "$path" --name "$name" --php "$php")
   [ "$https" = "1" ] && args+=(--https)
+  # atribuir el sitio a otro usuario (sólo el admin, para restaurar el sitio
+  # de alguien tras un incidente)
+  if [ -n "$owner" ]; then
+    is_admin || die "sólo el dueño de Herd puede atribuir un sitio a otro usuario"
+    args+=(--owner "$owner")
+  fi
   sudo_core "${args[@]}" || exit $?
   say ""
   say "Listo. Desde este Mac:  http${https:+s}://$name.$TLD"
@@ -290,6 +297,36 @@ owner_from_path() {  # /Users/alice/proyectos/x -> alice
   esac
 }
 
+# ¿el usuario actual es el dueño de Herd (el administrador del stack)?
+# Sólo él conserva la visión global de todos los sitios del Mac.
+is_admin() {
+  [ "$(id -un)" = "$HERD_USER" ]
+}
+
+# Dueño de un sitio. El manifiesto es la fuente de verdad; si el sitio no
+# está en él (nativo de 'herd link'), se deduce de la ruta del proyecto.
+site_owner() {  # $1 = nombre del sitio -> usuario (o "-" si no se sabe)
+  local name="$1" n path php https owner
+  if [ -f "$MANIFEST" ]; then
+    while IFS=$'\t' read -r n path php https owner; do
+      [ "$n" = "$name" ] || continue
+      if [ -n "$owner" ]; then
+        printf '%s' "$owner"
+        return 0
+      fi
+      # entrada antigua (sin columna de dueño): se deduce de la ruta
+      owner=$(owner_from_path "$path")
+      [ "$owner" != "-" ] && { printf '%s' "$owner"; return 0; }
+      break
+    done < "$MANIFEST"
+  fi
+  if [ -L "$SITES_DIR/$name" ]; then
+    owner=$(owner_from_path "$(readlink "$SITES_DIR/$name")")
+    [ "$owner" != "-" ] && { printf '%s' "$owner"; return 0; }
+  fi
+  printf '%s' "-"
+}
+
 vhost_php() {  # $1 = nombre del sitio
   local v
   v=$(grep -m1 -E "^# ISOLATED_PHP_VERSION=" "$NGINX_DIR/$1.$TLD" 2>/dev/null | sed 's/.*=//')
@@ -304,10 +341,16 @@ vhost_https() {  # $1 = nombre del sitio
 }
 
 # Vista por usuario: los sitios publicados por el usuario actual.
-# Con --all muestra los de todo el Mac.
+# Con --all muestra los de todo el Mac: sólo el dueño de Herd puede.
 cmd_links() {
   local all="0" user name path php https owner link seen=""
-  [ "${1:-}" = "--all" ] && all="1"
+  if [ "${1:-}" = "--all" ]; then
+    all="1"
+    if ! is_admin; then
+      die "la vista completa ('--all') es sólo del administrador del Herd ($HERD_USER)
+  → usa 'herd-site links' para ver tus sitios"
+    fi
+  fi
   user=$(id -un)
   printf '%-38s %-44s %-10s %-5s %s\n' SITIO RUTA DUEÑO PHP HTTPS
   # sitios gestionados por herd-site (manifiesto)
@@ -335,11 +378,17 @@ cmd_links() {
 }
 
 cmd_list() {
-  local vhost path ver
+  local vhost path ver name owner user
+  user=$(id -un)
   printf '%-34s %-46s %-6s %s\n' SITIO RUTA PHP HTTPS
   for vhost in "$NGINX_DIR"/*."$TLD"; do
     [ -e "$vhost" ] || continue
     name=$(basename "$vhost" | sed "s/\.$TLD$//")
+    # cada usuario ve sus sitios; el dueño de Herd los ve todos
+    owner=$(site_owner "$name")
+    if ! is_admin && [ "$owner" != "$user" ]; then
+      continue
+    fi
     path=$(readlink "$SITES_DIR/$name" 2>/dev/null || echo "-")
     ver=$(grep -m1 -E "^# ISOLATED_PHP_VERSION=" "$vhost" 2>/dev/null | sed 's/.*=//')
     case "$ver" in

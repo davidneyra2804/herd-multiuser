@@ -260,6 +260,42 @@ EOF
   say "LaunchAgent: $LAUNCH_AGENT"
 }
 
+# El manifiesto guarda una línea por sitio:
+#   nombre<TAB>ruta<TAB>php<TAB>https<TAB>dueño
+# Las entradas anteriores a la columna 'dueño' (4 campos) se migran aquí
+# deduciendo el dueño de la ruta del proyecto (/Users/<dueño>/...).
+# Sin esta columna el stack no puede saber qué sitio es de quién, que es la
+# base del aislamiento entre usuarios.
+migrate_manifest() {
+  local manifest="$SHARED/sites.tsv"
+  [ -f "$manifest" ] || return 0
+
+  local needs=0 name path php https owner
+  while IFS=$'\t' read -r name path php https owner; do
+    [ -n "$name" ] || continue
+    [ -n "$owner" ] || { needs=1; break; }
+  done < "$manifest"
+  [ "$needs" = "1" ] || return 0
+
+  step "Migrando el manifiesto (columna de dueño)"
+  local tmp
+  tmp=$(mktemp)
+  while IFS=$'\t' read -r name path php https owner; do
+    [ -n "$name" ] || continue
+    if [ -z "$owner" ]; then
+      owner=$(printf '%s' "$path" | sed 's#^/Users/##' | cut -d/ -f1)
+      case "$path" in
+        /Users/*/*) ;;
+        *) owner="$HERD_USER" ;;
+      esac
+      say "  $name: dueño = $owner"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$path" "$php" "$https" "$owner" >> "$tmp"
+  done < "$manifest"
+  install -m 644 -o "$HERD_USER" -g "$GROUP" "$tmp" "$manifest"
+  rm -f "$tmp"
+}
+
 prepare_herd_dirs() {
   step "Permisos de los directorios de Herd"
   # Sites y Nginx los escribe el núcleo privilegiado (root vía sudo) o el
@@ -360,6 +396,7 @@ write_config
 install_shared_php
 install_wrappers
 install_launch_agent
+migrate_manifest
 prepare_herd_dirs
 ensure_nginx_up
 

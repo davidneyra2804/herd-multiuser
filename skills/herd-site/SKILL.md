@@ -119,10 +119,20 @@ Homebrew y **no** lo toca este setup.
 
 ```bash
 herd-site links          # sólo lo tuyo
-herd-site links --all    # todo el Mac, con el dueño de cada sitio
-herd-site list           # vista global, con versión de PHP y HTTPS
+herd-site links --all    # todo el Mac — sólo el dueño de Herd
+herd-site list           # sitios con su versión de PHP y HTTPS
 herd-site versions       # qué versiones de PHP hay disponibles
 ```
+
+**Cada usuario sólo ve sus sitios.** `links` y `list` filtran por propietario, y
+`links --all` (la vista global) está reservado al **dueño de Herd**, que es
+quien repara el stack tras una actualización. Si un usuario normal lo intenta,
+el CLI lo rechaza con un mensaje explícito.
+
+Lo mismo aplica a las acciones: **nadie puede tocar los sitios de otro**.
+`herd-site unlink` de un sitio ajeno se rechaza, y publicar sobre el nombre de
+otro también. El núcleo comprueba la propiedad en cada operación, no sólo el
+CLI.
 
 ### Otros
 
@@ -161,6 +171,19 @@ herd-site selftest    # publica un proyecto de prueba y comprueba HTTP, HTTPS,
 
 `selftest` es el primer paso cuando un usuario dice "no me funciona": separa
 "el stack está roto" de "tu proyecto está mal".
+
+### Restaurar el sitio de otro usuario (sólo el dueño de Herd)
+
+Si un sitio de otro usuario se rompe y hay que restaurarlo, lo hace el
+**dueño de Herd**, atribuyendo el sitio a su propietario real:
+
+```bash
+herd-site link /Users/<otro>/proyectos/mi-app --name <nombre> --owner <otro>
+```
+
+`--owner` sólo lo acepta el dueño de Herd, y el sitio queda a nombre de ese
+usuario (no del admin). Sin `--owner`, el sitio quedaría a nombre de quien
+ejecuta el comando — y ese usuario no podría despublicarlo después.
 
 ### Los 9 fallos reales de Herd (síntoma → arreglo)
 
@@ -233,6 +256,27 @@ deja los vhosts como estaban.
 
 ## Modelo de permisos y seguridad
 
+### Aislamiento entre usuarios (REGLA DURA)
+
+**El objetivo del stack multiusuario es que un usuario no vea ni toque lo de
+otro.** Eso se aplica en tres niveles:
+
+1. **Visibilidad**: `links` y `list` sólo muestran los sitios del usuario que
+   pregunta. `links --all` (la visión global) es **sólo del dueño de Herd**.
+   `doctor` y `reapply` también se limitan a los sitios propios.
+2. **Propiedad**: cada sitio tiene un dueño (el que lo publicó, registrado en
+   el manifiesto). El núcleo **rechaza** `unlink` de un sitio ajeno y publicar
+   sobre el nombre de otro. El dueño de Herd puede repararlos (restaurar el
+   sitio de alguien tras un incidente).
+3. **Permisos de ruta**: un usuario sólo publica rutas sobre las que tiene
+   permiso de escritura. El dueño de Herd puede hacerlo sobre las de otros
+   (por eso puede repararlas).
+
+Si un usuario normal intenta algo que no le corresponde, el error lo dice
+claramente: *"el sitio 'X' no es tuyo (es de Y)"*.
+
+### Resto del modelo
+
 - **nginx y php-fpm corren como `dueño:staff`** → todo proyecto publicado
   necesita ser legible por el grupo `staff`.
 - `herd-site link` deja el proyecto en grupo `staff`, con `g+rX` en todo el
@@ -243,8 +287,7 @@ deja los vhosts como estaban.
   que exponga ficheros privados de otro.
 - El núcleo **exige saber quién pregunta** (`SUDO_USER`) y valida cada petición:
   rechaza publicar desde `/etc`, `/usr`, `/Applications`, `/Library`… y desde
-  rutas con `.ssh`, `.gnupg`, `.aws`, `Keychains`… Sólo se puede publicar
-  sobre rutas en las que el usuario tiene permiso de escritura.
+  rutas con `.ssh`, `.gnupg`, `.aws`, `Keychains`…
 - La regla sudoers es mínima: `%staff` puede ejecutar **sólo** el núcleo, que
   sólo sabe registrar, desvincular, recargar y auditar sitios.
 

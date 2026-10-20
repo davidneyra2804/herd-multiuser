@@ -150,6 +150,42 @@ requester_ok() {
   REQ_UID="$(id -u)"
 }
 
+# ¿quien pregunta es el dueño de Herd (el administrador del stack)?
+is_admin() {
+  [ "$REQ_USER" = "$HERD_USER" ]
+}
+
+# Dueño de un sitio: el manifiesto es la fuente de verdad; si no está (sitio
+# nativo de 'herd link'), se deduce de la ruta del proyecto.
+site_owner() {  # $1 = nombre del sitio -> usuario (o "-" si no se sabe)
+  local name="$1" n path php https owner
+  if [ -f "$MANIFEST" ]; then
+    while IFS=$'\t' read -r n path php https owner; do
+      [ "$n" = "$name" ] || continue
+      [ -n "$owner" ] && { printf '%s' "$owner"; return 0; }
+      break
+    done < "$MANIFEST"
+  fi
+  # sitio nativo de Herd: el dueño es el usuario cuyo home contiene la ruta
+  if [ -L "$SITES_DIR/$name" ]; then
+    path=$(readlink "$SITES_DIR/$name")
+    case "$path" in
+      /Users/*/*) printf '%s' "$path" | sed 's#^/Users/##' | cut -d/ -f1; return 0 ;;
+    esac
+  fi
+  printf '%s' "-"
+}
+
+# Un usuario sólo puede tocar sus propios sitios. El dueño de Herd puede
+# tocar todos (es quien repara el stack tras una actualización).
+may_touch() {  # $1 = nombre del sitio
+  local owner
+  owner=$(site_owner "$1")
+  is_admin && return 0
+  [ "$owner" = "$REQ_USER" ] && return 0
+  return 1
+}
+
 path_blocked() {  # $1 = ruta absoluta
   local p="$1" comp root
   case "$p" in
@@ -173,6 +209,10 @@ path_blocked() {  # $1 = ruta absoluta
 
 path_ok_for_user() {  # el usuario real debe poder publicar esta ruta
   local p="$1"
+  # el dueño de Herd puede publicar rutas de otros: es quien repara el stack
+  # (tras una actualización, o para restaurar el sitio de un usuario tras un
+  # incidente). Los demás usuarios, sólo las suyas.
+  is_admin && return 0
   case "$p" in
     "/Users/$REQ_USER"|"/Users/$REQ_USER"/*) return 0 ;;
   esac
@@ -473,7 +513,7 @@ EOF
 # ------------------------------------------------------------------ acciones
 
 cmd_link() {
-  local path="" name="" php="" https="0"
+  local path="" name="" php="" https="0" owner=""
   # todo se ejecuta desde el home de Herd: nada debe caer en el directorio
   # del proyecto desde el que ha llamado el usuario
   cd "$HERD_HOME" 2>/dev/null || true
@@ -483,6 +523,7 @@ cmd_link() {
       --name) name="$2"; shift 2 ;;
       --php) php="$2"; shift 2 ;;
       --https) https="1"; shift ;;
+      --owner) owner="$2"; shift 2 ;;
       *) die "argumento desconocido: $1" ;;
     esac
   done
@@ -491,7 +532,6 @@ cmd_link() {
   [ -d "$path" ] || die "no es un directorio: $path"
   path=$(cd "$path" 2>/dev/null && pwd -P) || die "no se puede resolver: $path"
   path_blocked "$path" && die "ruta bloqueada por política: $path"
-  path_ok_for_user "$path" || die "$REQ_USER no tiene permisos sobre $path"
 
   [ -n "$name" ] || die "falta --name"
   case "$name" in
@@ -502,6 +542,26 @@ cmd_link() {
     *[!a-z0-9-]*) die "nombre de sitio inválido: $name" ;;
   esac
   [ "${#name}" -le 48 ] || die "nombre de sitio demasiado largo"
+
+  # --owner: el admin puede atribuir un sitio al usuario que lo posee de
+  # verdad (al restaurar el sitio de otro tras un incidente). Sólo el admin.
+  if [ -n "$owner" ]; then
+    is_admin || die "sólo el dueño de Herd puede atribuir un sitio a otro usuario"
+    id -u "$owner" >/dev/null 2>&1 || die "usuario desconocido: $owner"
+  else
+    owner="$REQ_USER"
+  fi
+
+  # la propiedad del nombre se comprueba ANTES que los permisos de la ruta:
+  # si el nombre ya es de otro, ése es el motivo real del rechazo
+  if [ -e "$SITES_DIR/$name" ] || [ -f "$NGINX_DIR/$name.$TLD" ]; then
+    if ! may_touch "$name"; then
+      die "el sitio '$name' ya existe y es de $(site_owner "$name")
+  → usa otro --name. Cada sitio pertenece a quien lo publicó."
+    fi
+  fi
+
+  path_ok_for_user "$path" || die "$REQ_USER no tiene permisos sobre $path"
 
   if [ -z "$php" ]; then php=$(default_php); fi
   php_allowed "$php" || die "versión de PHP no permitida: $php"
@@ -556,7 +616,7 @@ $CONFIG_ERR"
   fi
   [ -n "$backup" ] && rm -f "$backup"
 
-  manifest_add "$name" "$path" "$php" "$https"
+  manifest_add "$name" "$path" "$php" "$https" "$owner"
 
   say "OK $name"
   if [ "$https" = "1" ]; then
@@ -579,6 +639,12 @@ cmd_unlink() {
   done
   [ -n "$name" ] || die "falta --name"
   case "$name" in *[!a-z0-9-]*) die "nombre de sitio inválido: $name" ;; esac
+
+  # cada usuario sólo puede despublicar SUS sitios (el admin, todos)
+  if ! may_touch "$name"; then
+    die "el sitio '$name' no es tuyo (es de $(site_owner "$name"))
+  → cada usuario sólo puede despublicar sus propios sitios."
+  fi
 
   local removed=0
   if [ -L "$SITES_DIR/$name" ]; then
@@ -621,12 +687,16 @@ EOF
 }
 
 cmd_reapply() {
-  local n=0 name path php https vhost backup
+  local n=0 name path php https owner vhost backup
   [ -f "$MANIFEST" ] || die "no hay sitios gestionados por herd-site"
   local backups
   backups=$(mktemp -d)
-  while IFS=$'\t' read -r name path php https; do
+  while IFS=$'\t' read -r name path php https owner; do
     [ -n "$name" ] || continue
+    # cada usuario regenera los vhosts de SUS sitios; el admin, los de todos
+    if ! is_admin && [ "$owner" != "$REQ_USER" ]; then
+      continue
+    fi
     if [ ! -d "$path" ]; then
       say "  $name: se omite (ya no existe $path)"
       continue
@@ -655,13 +725,16 @@ $CONFIG_ERR"
 }
 
 cmd_prune() {
-  local n=0 name path php https tmp
+  local n=0 name path php https owner tmp
   [ -f "$MANIFEST" ] || die "no hay manifiesto"
   tmp=$(mktemp)
-  while IFS=$'\t' read -r name path php https; do
+  # OJO: se leen 5 campos (el último es el dueño) y se reescriben los 5.
+  # Si se perdera el dueño, el manifiesto dejaría de saber qué sitio es de
+  # quién y el aislamiento entre usuarios se rompería.
+  while IFS=$'\t' read -r name path php https owner; do
     [ -n "$name" ] || continue
     if [ -d "$path" ] && [ -L "$SITES_DIR/$name" ]; then
-      printf '%s\t%s\t%s\t%s\n' "$name" "$path" "$php" "$https" >> "$tmp"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$path" "$php" "$https" "$owner" >> "$tmp"
     else
       say "  $name: el sitio ya no existe, se quita del manifiesto"
       n=$((n+1))
@@ -679,8 +752,12 @@ cmd_doctor() {
   say "prefijo estático: $uuid_current"
   say ""
   say "SITIO                          PHP   HTTPS  ESTADO"
-  while IFS=$'\t' read -r name path php https; do
+  # cada usuario audita sus sitios; el dueño de Herd los ve todos
+  while IFS=$'\t' read -r name path php https owner; do
     [ -n "$name" ] || continue
+    if ! is_admin && [ "$owner" != "$REQ_USER" ]; then
+      continue
+    fi
     local state="ok" detail=""
     vhost="$NGINX_DIR/$name.$TLD"
     if [ ! -f "$vhost" ]; then

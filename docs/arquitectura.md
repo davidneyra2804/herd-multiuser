@@ -51,11 +51,41 @@ binarios de PHP y el `php.ini` viven en `~/Library/Application Support/Herd`, y
   y cualquier ruta con `.ssh`, `.gnupg`, `.aws`, `.kube`, `.config`,
   `Keychains`, `Mail`…
 - Sólo se puede publicar sobre rutas en las que el usuario que pregunta tiene
-  permiso de escritura (o que están bajo su home).
+  permiso de escritura (o que están bajo su home). El dueño de Herd sí puede
+  sobre rutas de otros: es quien repara el stack.
+- **Propiedad de los sitios**: cada sitio pertenece a quien lo publicó (columna
+  `dueño` del manifiesto). El núcleo rechaza `unlink` de un sitio ajeno y
+  publicar sobre el nombre de otro. Sólo el dueño de Herd puede saltarse esa
+  comprobación (para reparar), y entonces puede atribuir el sitio a su
+  propietario real con `--owner`.
 - El nombre del sitio se valida: `^[a-z0-9-]{1,48}$`.
 - La regla sudoers es mínima: `%staff ALL=(root) NOPASSWD: <núcleo>` → el
   núcleo sólo sabe hacer cuatro cosas (vincular, desvincular, recargar,
  auditar).
+
+## Aislamiento entre usuarios
+
+Es el objetivo del proyecto, y se aplica en tres capas:
+
+1. **Visibilidad** (en el CLI): `links` y `list` filtran por propietario;
+   `doctor` y `reapply` sólo tocan los sitios del usuario que pregunta. La
+   visión global (`links --all`) es sólo del dueño de Herd.
+2. **Propiedad** (en el núcleo): cada operación comprueba a quién pertenece el
+   sitio. Un usuario no puede despublicar el sitio de otro ni publicar sobre su
+   nombre.
+3. **Permisos de ruta**: cada usuario sólo publica donde tiene permiso de
+   escritura.
+
+El manifiesto (`$PREFIX/share/herd-shared/sites.tsv`) guarda una línea por
+sitio: `nombre<TAB>ruta<TAB>php<TAB>https<TAB>dueño`. Esa última columna es
+la que hace posible el aislamiento; las entradas antiguas (sin ella) se
+migran solas al instalar, deduciendo el dueño de la ruta.
+
+> El aislamiento es **de la herramienta**, no del sistema de ficheros: el
+> manifiesto y los vhosts son legibles por el grupo `staff`. Quien tenga
+> acceso a la consola del Mac puede leerlos con `cat`. Para cerrar esa vía
+> habría que restringir los permisos de esos ficheros (y que el CLI consultase
+> al núcleo en vez de leerlos directamente).
 
 ## Problemas reales encontrados (y su arreglo)
 

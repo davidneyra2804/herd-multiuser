@@ -42,7 +42,10 @@ Y ya está: `http://alice-mi-app.<tld>` funciona en el Mac y en la LAN.
 
 Además, cosas que Herd no tiene porque en un Mac multiusuario hacen falta:
 
-- **`herd-site links --all`** — qué ha publicado cada uno, con su dueño.
+- **Aislamiento entre usuarios**: cada usuario ve y toca **sólo sus sitios**.
+  `links` y `list` filtran por propietario; la visión global (`links --all`) es
+  sólo del dueño de Herd; y el núcleo **rechaza** que alguien despublicue el
+  sitio de otro o publique sobre su nombre.
 - **`herd-site doctor`** — auditoría: listeners, versión de PHP, certificado,
   php-fpm en marcha, UUID de Herd… y avisa de lo que se ha quedado obsoleto.
 - **`herd-site reapply`** — regenera los vhosts (para cuando actualizas Herd).
@@ -227,6 +230,20 @@ modelo de seguridad…) está en **[docs/arquitectura.md](docs/arquitectura.md)*
 - **[docs/guia.md](docs/guia.md)** — guía práctica para el equipo.
 - **[docs/arquitectura.md](docs/arquitectura.md)** — diseño, permisos,
   seguridad y problemas resueltos.
+- **[skills/herd-site/](skills/herd-site/)** — skill de agente: cómo usar
+  `herd-site` y qué fallos de Herd hay que conocer.
+
+## Tests
+
+```bash
+./tests/test-aislamiento.sh
+```
+
+Comprueba que un usuario **no puede** ver ni tocar los sitios de otro: que
+`links`/`list`/`doctor` filtran por propietario, que `--all` se rechaza fuera
+del dueño de Herd, y que el núcleo rechaza `unlink` y `link` sobre sitios
+ajenos. Simula a otro usuario con un shim de `id`, así que no hace falta su
+contraseña.
 
 ## Licencia
 

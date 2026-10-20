@@ -87,6 +87,30 @@ todos los usuarios del Mac, sin avisos del navegador.
   los escribe el núcleo privilegiado. Así ningún usuario puede inyectar un
   vhost que exponga ficheros privados de otro usuario.
 
+### Aislamiento entre usuarios
+
+El objetivo de este setup es que **un usuario no vea ni toque lo de otro**:
+
+| | Qué ve | Qué puede tocar |
+|---|---|---|
+| **Usuario normal** | sólo sus sitios (`links`, `list`, `doctor`) | sólo publicar/despublicar **sus** sitios |
+| **Dueño de Herd** | todos los sitios (`links --all`) | todos (repara el stack, restaura sitios) |
+
+- `herd-site links --all` (la visión global) está reservado al dueño de Herd:
+  si lo pide otro usuario, el CLI lo rechaza con un mensaje explícito.
+- El **núcleo** comprueba la propiedad en cada operación: no se puede
+  despublicar el sitio de otro (`el sitio 'X' no es tuyo (es de Y)`) ni
+  publicar sobre el nombre de otro.
+- Cada sitio se atribuye a quien lo publicó; el manifiesto guarda esa columna
+  (las entradas anteriores a esa columna se migran solas al instalar).
+- El dueño de Herd puede publicar sobre rutas de otros (para repararlas). Si
+  restaura el sitio de alguien, debe pasarlo con `--owner <usuario>` para que
+  el sitio siga siendo de ese usuario:
+
+  ```bash
+  herd-site link /Users/<otro>/proyectos/mi-app --name <nombre> --owner <otro>
+  ```
+
 ### Qué se bloquea
 
 El núcleo rechaza publicar rutas de `/etc`, `/usr`, `/bin`, `/opt`, `/var`,
