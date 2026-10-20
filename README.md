@@ -86,6 +86,17 @@ herd-site selftest    # prueba de extremo a extremo (publica, comprueba y borra)
 - [docs/arquitectura.md](docs/arquitectura.md) — cómo funciona por dentro, el
   modelo de permisos y de seguridad, y los problemas que hubo que resolver.
 
+## Publicar en GitHub
+
+```bash
+gh auth login                      # con la cuenta en la que quieras publicarlo
+./publish.sh                       # crea el repo (privado) y hace push
+```
+
+`publish.sh` usa la clave SSH de la cuenta personal (`github-personal` en
+`~/.ssh/config`) para el push, de modo que no depende de con qué cuenta esté
+autenticado `gh` para *leer* el repositorio.
+
 ## Desinstalar
 
 ```bash
