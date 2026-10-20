@@ -13,7 +13,23 @@ set -uo pipefail
 # Configuración: se lee del config.env del runtime compartido (lo escribe el
 # instalador) y si no existe se deduce del entorno. Así el mismo código
 # funciona en otro Mac con otro usuario propietario de Herd.
-SHARED="${SHARED:-/opt/homebrew/share/herd-shared}"
+# --- prefijo de instalación -----------------------------------------------
+# El núcleo vive en $PREFIX/libexec -> el prefijo es su directorio padre.
+# Se deduce de la ruta real del script (resolviendo symlinks) para que
+# funcione en Apple Silicon (/opt/homebrew) y en Intel (/usr/local).
+_self_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [ -L "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" 2>/dev/null && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+  done
+  cd -P "$(dirname "$src")" 2>/dev/null && pwd
+}
+PREFIX="${PREFIX:-$(dirname "$(_self_dir)")}"
+[ -d "$PREFIX/bin" ] && [ -d "$PREFIX/libexec" ] || PREFIX="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
+
+SHARED="${SHARED:-$PREFIX/share/herd-shared}"
 [ -f "$SHARED/config.env" ] && . "$SHARED/config.env" 2>/dev/null
 
 HERD_USER="${HERD_USER:-$(id -un)}"
@@ -591,10 +607,12 @@ cmd_certs() {
 
 cmd_install_sudoers() {
   local f="/etc/sudoers.d/herd-site"
+  # la ruta debe ser EXACTA: sudoers no acepta comodines ni rutas relativas
+  local core="$PREFIX/libexec/herd-site-core"
   cat > "$f" <<EOF
 # Permite publicar/quitar sitios en el Herd compartido sin contraseña de root.
-# El núcleo (/opt/homebrew/libexec/herd-site-core) valida cada petición.
-%staff ALL=(root) NOPASSWD: /opt/homebrew/libexec/herd-site-core
+# El núcleo ($core) valida cada petición.
+%staff ALL=(root) NOPASSWD: $core
 EOF
   chmod 440 "$f"
   chown root:wheel "$f"

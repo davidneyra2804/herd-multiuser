@@ -2,11 +2,11 @@
 # herd-shared-setup — deja el Mac con un Herd compartido por todos los usuarios.
 #
 #   <prefix>/libexec/herd-shared-setup                   -> parte del usuario (sin sudo)
-#   sudo /opt/homebrew/libexec/herd-shared-setup --root -> parte de root (sudoers, firewall)
+#   sudo $PREFIX/libexec/herd-shared-setup --root -> parte de root (sudoers, firewall)
 #
 # Lo que instala la parte sin sudo:
-#   /opt/homebrew/share/herd-shared/php/<ver>/{php,php-fpm,php.ini}
-#   /opt/homebrew/bin/php74 php83 php84 php85 php composer
+#   $PREFIX/share/herd-shared/php/<ver>/{php,php-fpm,php.ini}
+#   $PREFIX/bin/php74 php83 php84 php85 php composer
 #   ~/Library/LaunchAgents/com.herd.multiusuario.reload.plist
 #
 # Lo que instala la parte con sudo:
@@ -16,15 +16,30 @@
 set -uo pipefail
 
 HERD_APP="${HERD_APP:-/Applications/Herd.app/Contents/Resources}"
-SHARED="${SHARED:-/opt/homebrew/share/herd-shared}"
+# --- prefijo de instalación -----------------------------------------------
+# El setup vive en $PREFIX/libexec -> el prefijo es su directorio padre.
+# Se deduce de la ruta real del script (resolviendo symlinks) para que
+# funcione en Apple Silicon (/opt/homebrew) y en Intel (/usr/local).
+_self_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [ -L "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" 2>/dev/null && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+  done
+  cd -P "$(dirname "$src")" 2>/dev/null && pwd
+}
+PREFIX="${PREFIX:-$(dirname "$(_self_dir)")}"
+[ -d "$PREFIX/bin" ] && [ -d "$PREFIX/libexec" ] || PREFIX="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
+
+SHARED="${SHARED:-$PREFIX/share/herd-shared}"
 [ -f "$SHARED/config.env" ] && . "$SHARED/config.env" 2>/dev/null
 HERD_USER="${HERD_USER:-$(id -un)}"
 HERD_HOME="${HERD_HOME:-/Users/$HERD_USER/Library/Application Support/Herd}"
 
-SHARED="/opt/homebrew/share/herd-shared"
 SHARED_PHP="$SHARED/php"
-BIN="/opt/homebrew/bin"
-LIBEXEC="/opt/homebrew/libexec"
+BIN="$PREFIX/bin"
+LIBEXEC="$PREFIX/libexec"
 LAUNCH_AGENT="/Users/$HERD_USER/Library/LaunchAgents/com.herd.multiusuario.reload.plist"
 
 # El TLD es el que tenga configurado Herd (`herd tld`): no es fijo, cada
@@ -147,8 +162,8 @@ EOF
   if [ -f "$HERD_HOME/bin/composer" ]; then
     cp -f "$HERD_HOME/bin/composer" "$BIN/composer.phar"
     say "composer.phar (de Herd) copiado a $BIN/composer.phar"
-  elif [ -f /opt/homebrew/Cellar/composer/*/bin/composer ]; then
-    cp -f /opt/homebrew/Cellar/composer/*/bin/composer "$BIN/composer.phar"
+  elif ls "$PREFIX"/Cellar/composer/*/bin/composer >/dev/null 2>&1; then
+    cp -f "$PREFIX"/Cellar/composer/*/bin/composer "$BIN/composer.phar"
     say "composer.phar (de Homebrew) copiado a $BIN/composer.phar"
   else
     rm -f "$BIN/composer.phar"
@@ -192,7 +207,7 @@ PIDFILE="$HERD_HOME/bin/nginx.pid"
 STAMP="\${HOME}/Library/Caches/herd-reload.stamp"
 LOG="\${HOME}/Library/Logs/herd-multiusuario.log"
 # el CLI de Herd necesita php en el PATH (launchd sólo da /usr/bin:/bin:...)
-export PATH="/Users/$HERD_USER/Library/Application Support/Herd/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH="/Users/$HERD_USER/Library/Application Support/Herd/bin:$BIN:/usr/bin:/bin:/usr/sbin:/sbin"
 mkdir -p "\$(dirname "\$STAMP")" "\$(dirname "\$LOG")" 2>/dev/null
 log() { printf '%s %s\n' "\$(date '+%F %T')" "\$1" >> "\$LOG"; }
 current=\$(stat -f '%m' "\$NGINX_DIR" 2>/dev/null)

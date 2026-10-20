@@ -85,8 +85,41 @@ el repositorio (`git pull` + `./install.sh`).
 | Manifiesto de sitios | `$PREFIX/share/herd-shared/sites.tsv` |
 | Recarga automática de nginx | `~/Library/LaunchAgents/com.herd.multiusuario.reload.plist` |
 | Regla sudoers | `/etc/sudoers.d/herd-site` |
+| Skill de agente | `~/.config/opencode/skills/herd-site`, `~/.claude/skills/herd-site`, `~/.agents/skills/herd-site` |
 
 (`$PREFIX` = `brew --prefix`, normalmente `/opt/homebrew`.)
+
+---
+
+## Skill para agentes (LLM)
+
+`./install.sh` instala además una **skill** que enseña a un LLM a manejar
+`herd-site`: publicar proyectos, fijar la versión de PHP, resolver HTTPS,
+auditar con `doctor`/`selftest`, y — lo más importante — **no caer en los 9
+fallos reales de Herd** (vhosts sólo-loopback, `nginx -t` ensuciando el
+proyecto, caché de `realpath()` del php-fpm, el socket `127.0.0.1` ganando al
+`0.0.0.0`, …).
+
+Está en [`skills/herd-site/`](skills/herd-site/) y se instala en los tres
+directorios que descubren los agentes habituales:
+
+| Ruta | Para |
+|---|---|
+| `~/.config/opencode/skills/herd-site/` | OpenCode |
+| `~/.claude/skills/herd-site/` | Claude Code |
+| `~/.agents/skills/herd-site/` | agentes compatibles con `.agents` |
+
+Se puede instalar **sólo** la skill, sin tocar el resto del stack:
+
+```bash
+./install.sh --skill
+```
+
+Si ya tienes la skill instalada y la has editado a mano, `install.sh` **no la
+pisa**: te avisa y la deja como está.
+
+Para usarla en otro Mac, basta con copiar la carpeta `skills/herd-site/` a
+cualquiera de esas rutas.
 
 ---
 

@@ -19,26 +19,43 @@
 # El sitio queda disponible en http[s]://<host>.backend.test para todos los
 # usuarios del Mac y, por los listeners 0.0.0.0, también desde la LAN.
 #
-# El núcleo privilegiado vive en /opt/homebrew/libexec/herd-site-core y se
-# invoca con sudo (regla en /etc/sudoers.d/herd-site, instalada por
-# `sudo /opt/homebrew/libexec/herd-shared-setup --root`).
+# El núcleo privilegiado vive en $PREFIX/libexec/herd-site-core (PREFIX =
+# `brew --prefix`) y se invoca con sudo (regla en /etc/sudoers.d/herd-site,
+# instalada por `sudo $PREFIX/libexec/herd-shared-setup --root`).
 
 set -uo pipefail
 
-SHARED="${SHARED:-/opt/homebrew/share/herd-shared}"
+# --- prefijo de instalación -----------------------------------------------
+# Se deduce de la ruta real del propio script (resolviendo symlinks), de modo
+# que funciona igual en Apple Silicon (/opt/homebrew) que en Intel
+# (/usr/local). Se puede forzar con PREFIX=... en el entorno.
+_self_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [ -L "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" 2>/dev/null && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+  done
+  cd -P "$(dirname "$src")" 2>/dev/null && pwd
+}
+# el CLI vive en $PREFIX/bin -> el prefijo es su directorio padre
+PREFIX="${PREFIX:-$(dirname "$(_self_dir)")}"
+# si no parece una instalación real (p.ej. se ejecuta desde el repo), se usa
+# el prefijo de Homebrew
+[ -f "$PREFIX/libexec/herd-site-core" ] || PREFIX="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
+
+SHARED="${SHARED:-$PREFIX/share/herd-shared}"
 [ -f "$SHARED/config.env" ] && . "$SHARED/config.env" 2>/dev/null
 
 HERD_USER="${HERD_USER:-$(id -un)}"
 HERD_HOME="${HERD_HOME:-/Users/$HERD_USER/Library/Application Support/Herd}"
 SITES_DIR="$HERD_HOME/config/valet/Sites"
 NGINX_DIR="$HERD_HOME/config/valet/Nginx"
-SHARED="/opt/homebrew/share/herd-shared"
 SHARED_PHP="$SHARED/php"
 TLD="${TLD:-test}"
-CORE="${CORE:-/opt/homebrew/libexec/herd-site-core}"
+CORE="${CORE:-$PREFIX/libexec/herd-site-core}"
 MANIFEST="$SHARED/sites.tsv"
-SHARED_PHP="$SHARED/php"
-COMPOSER_PHAR="${COMPOSER_PHAR:-/opt/homebrew/bin/composer.phar}"
+COMPOSER_PHAR="${COMPOSER_PHAR:-$PREFIX/bin/composer.phar}"
 
 # El TLD es el que tenga configurado Herd (`herd tld`): no es fijo, cada
 # equipo puede usar el suyo (.test es el estándar de Herd).
@@ -185,7 +202,7 @@ sudo_core() {
   if [ "$rc" != "0" ] && printf '%s' "$out" | grep -qiE "password is required|not allowed|may not run|is not in the sudoers"; then
     die "sudo no permite ejecutar el núcleo de herd-site para tu usuario.
   → el admin del Mac debe ejecutar una vez:
-      sudo /opt/homebrew/libexec/herd-shared-setup --root"
+      sudo $PREFIX/libexec/herd-shared-setup --root"
   fi
   printf '%s\n' "$out"
   return $rc
@@ -339,7 +356,7 @@ cmd_versions() {
   printf 'PHP disponibles en el Herd compartido:\n'
   for v in $(installed_php); do
     if [ -x "$SHARED_PHP/$(printf '%s' "${v//./}")/php" ]; then
-      printf '  %-5s  fpm: %s  cli: /opt/homebrew/bin/php%s\n' "$v" "$(printf '%s' "${v//./}")" "$(printf '%s' "${v//./}")"
+      printf '  %-5s  fpm: %s  cli: %s/bin/php%s\n' "$v" "$(printf '%s' "${v//./}")" "$PREFIX" "$(printf '%s' "${v//./}")"
     else
       printf '  %-5s  fpm: %s  cli: (no expuesta)\n' "$v" "$(printf '%s' "${v//./}")"
     fi

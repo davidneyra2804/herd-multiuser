@@ -42,6 +42,14 @@ launchctl bootout "gui/$(id -u $HERD_USER)/com.herd.multiusuario.reload" 2>/dev/
 rm -f "$HOME/Library/LaunchAgents/com.herd.multiusuario.reload.plist"
 say "LaunchAgent quitado"
 
+step "Quitando la skill de agente"
+for d in "$HOME/.config/opencode/skills/herd-site" \
+         "$HOME/.claude/skills/herd-site" \
+         "$HOME/.agents/skills/herd-site"; do
+  [ -d "$d" ] || continue
+  rm -rf "$d" && say "$d"
+done
+
 if [ "$KEEP_SITES" != "--keep-sites" ]; then
   step "Quitando los sitios publicados"
   for v in "$HERD_HOME"/config/valet/Nginx/*.backend.test; do

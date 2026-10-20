@@ -10,3 +10,6 @@ share/herd-shared/
 
 # macOS
 .DS_Store
+
+# marcador de la copia instalada de la skill (lo genera install.sh)
+.source-hash
