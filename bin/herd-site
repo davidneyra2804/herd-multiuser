@@ -1,0 +1,444 @@
+#!/bin/bash
+# herd-site — publica proyectos de cualquier usuario del Mac en el Herd compartido.
+#
+#   herd-site link <ruta> [--name <host>] [--php <ver>] [--https] [--no-namespace] [--force]
+#   herd-site unlink <host>
+#   herd-site links [--all] # enlaces del usuario actual (--all: de todos)
+#   herd-site php [args]    # php de la versión aislada del proyecto (como 'herd php')
+#   herd-site composer ...  # composer con esa versión de PHP (como 'herd composer')
+#   herd-site list
+#   herd-site versions
+#   herd-site php-version [ruta]
+#   herd-site certs [--refresh]
+#   herd-site reapply      # regenera los vhosts tras actualizar Herd
+#   herd-site doctor       # comprueba que todo sigue en su sitio
+#   herd-site prune        # quita del manifiesto los sitios que ya no existen
+#   herd-site selftest     # prueba de extremo a extremo (publica un proyecto)
+#   herd-site reload
+#
+# El sitio queda disponible en http[s]://<host>.backend.test para todos los
+# usuarios del Mac y, por los listeners 0.0.0.0, también desde la LAN.
+#
+# El núcleo privilegiado vive en /opt/homebrew/libexec/herd-site-core y se
+# invoca con sudo (regla en /etc/sudoers.d/herd-site, instalada por
+# `sudo /opt/homebrew/libexec/herd-shared-setup --root`).
+
+set -uo pipefail
+
+SHARED="${SHARED:-/opt/homebrew/share/herd-shared}"
+[ -f "$SHARED/config.env" ] && . "$SHARED/config.env" 2>/dev/null
+
+HERD_USER="${HERD_USER:-$(id -un)}"
+HERD_HOME="${HERD_HOME:-/Users/$HERD_USER/Library/Application Support/Herd}"
+SITES_DIR="$HERD_HOME/config/valet/Sites"
+NGINX_DIR="$HERD_HOME/config/valet/Nginx"
+SHARED="/opt/homebrew/share/herd-shared"
+SHARED_PHP="$SHARED/php"
+TLD="backend.test"
+CORE="${CORE:-/opt/homebrew/libexec/herd-site-core}"
+MANIFEST="$SHARED/sites.tsv"
+SHARED_PHP="$SHARED/php"
+COMPOSER_PHAR="${COMPOSER_PHAR:-/opt/homebrew/bin/composer.phar}"
+
+die() { printf 'herd-site: %s\n' "$1" >&2; exit "${2:-1}"; }
+say() { printf '%s\n' "$1"; }
+hint() { printf '  → %s\n' "$1"; }
+
+usage() {
+  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# ---------------------------------------------------------------- utilidades
+
+sanitise() {  # deja sólo [a-z0-9-], recorta a 48 chars
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -e 's/[^a-z0-9-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-*//' -e 's/-*$//' \
+    | cut -c1-48
+}
+
+herdyml_lookup() {  # $1=ruta $2=clave -> valor
+  local dir="$1" key="$2" f v
+  dir=$(cd "$dir" 2>/dev/null && pwd -P) || return 1
+  while [ -n "$dir" ] && [ "$dir" != "/" ]; do
+    f="$dir/herd.yml"
+    if [ -f "$f" ]; then
+      v=$(grep -E "^[[:space:]]*${key}:" "$f" | head -1 \
+          | sed -E "s/^[[:space:]]*${key}:[[:space:]]*['\"]?([^'\"#]+).*/\1/" \
+          | tr -d '[:space:]')
+      [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+      return 1
+    fi
+    dir=$(dirname "$dir")
+  done
+  return 1
+}
+
+default_php() {
+  "$HERD_HOME/bin/php" -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null
+}
+
+# Igual que Herd, con un paso extra:
+#   1) sitio publicado por herd-site cuya ruta es la actual -> su versión
+#   2) fichero .valetphprc del proyecto (convención de Herd)
+#   3) herd.yml del proyecto (aunque aún no esté publicado)
+#   4) versión por defecto del Herd
+resolve_php_version() {  # $1 = directorio
+  local dir="$1" ver="" name path php https owner
+  dir=$(cd "$dir" 2>/dev/null && pwd -P) || dir="$1"
+
+  if [ -f "$MANIFEST" ]; then
+    while IFS=$'\t' read -r name path php https owner; do
+      [ -n "$name" ] || continue
+      if [ "$path" = "$dir" ]; then
+        printf '%s' "$php"
+        return 0
+      fi
+    done < "$MANIFEST"
+  fi
+
+  if [ -f "$dir/.valetphprc" ]; then
+    ver=$(tr -d '[:space:]' < "$dir/.valetphprc")
+    [ -n "$ver" ] && { printf '%s' "$ver"; return 0; }
+  fi
+
+  ver=$(herdyml_lookup "$dir" php 2>/dev/null || true)
+  [ -n "$ver" ] && { printf '%s' "$ver"; return 0; }
+
+  default_php
+}
+
+php_bin_for() {  # $1 = versión -> ruta del binario en el runtime compartido
+  local tag; tag=$(printf '%s' "$1" | tr -d '.')
+  printf '%s' "$SHARED_PHP/$tag/php"
+}
+
+cmd_php() {
+  local ver bin
+  ver=$(resolve_php_version "$PWD")
+  bin=$(php_bin_for "$ver")
+  if [ ! -x "$bin" ]; then
+    # si el runtime compartido no tiene esa versión, se usa el binario de Herd
+    bin="$HERD_HOME/bin/php$(printf '%s' "$ver" | tr -d '.')"
+    [ -x "$bin" ] || die "no hay PHP $ver disponible (ni en el Herd compartido ni en Herd)"
+  fi
+  export PHP_INI_SCAN_DIR="$(dirname "$bin")/scandir"
+  exec "$bin" -c "$(dirname "$bin")/php.ini" "$@"
+}
+
+cmd_composer() {
+  local ver bin phar
+  ver=$(resolve_php_version "$PWD")
+  bin=$(php_bin_for "$ver")
+  [ -x "$bin" ] || bin="$HERD_HOME/bin/php$(printf '%s' "$ver" | tr -d '.')"
+  [ -x "$bin" ] || die "no hay PHP $ver disponible"
+  phar="$COMPOSER_PHAR"
+  [ -f "$phar" ] || die "no se encuentra el phar de composer ($phar)"
+  export PHP_INI_SCAN_DIR="$(dirname "$bin")/scandir"
+  exec "$bin" -c "$(dirname "$bin")/php.ini" "$phar" "$@"
+}
+
+installed_php() {
+  local f v
+  for f in "$HERD_HOME"/bin/php[0-9][0-9]-fpm; do
+    [ -e "$f" ] || continue
+    v=$(basename "$f"); v=${v#php}; v=${v%-fpm}
+    case "$v" in
+      74) echo 7.4 ;; 80) echo 8.0 ;; 81) echo 8.1 ;; 82) echo 8.2 ;;
+      83) echo 8.3 ;; 84) echo 8.4 ;; 85) echo 8.5 ;; 86) echo 8.6 ;;
+    esac
+  done
+}
+
+sudo_core() {
+  # El dueño del Herd (agentmaster) opera sin sudo; el resto usa la regla
+  # sudoers que instala `herd-shared-setup --root`.
+  if [ "$(id -un)" = "$HERD_USER" ]; then
+    "$CORE" "$@"
+    return $?
+  fi
+  if ! command -v sudo >/dev/null 2>&1; then
+    die "sudo no está disponible"
+  fi
+  # OJO: no se comprueba con `sudo -n true` porque la regla sólo permite un
+  # comando concreto; se intenta el comando real y se explica el rechazo.
+  local out rc
+  out=$(sudo -n "$CORE" "$@" 2>&1)
+  rc=$?
+  if [ "$rc" != "0" ] && printf '%s' "$out" | grep -qiE "password is required|not allowed|may not run|is not in the sudoers"; then
+    die "sudo no permite ejecutar el núcleo de herd-site para tu usuario.
+  → el admin del Mac debe ejecutar una vez:
+      sudo /opt/homebrew/libexec/herd-shared-setup --root"
+  fi
+  printf '%s\n' "$out"
+  return $rc
+}
+
+# ------------------------------------------------------------------ acciones
+
+cmd_link() {
+  local path="" name="" php="" https="" namespace="1" force="0"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      --php) php="$2"; shift 2 ;;
+      --https) https="1"; shift ;;
+      --no-namespace) namespace="0"; shift ;;
+      --force) force="1"; shift ;;
+      --*) die "opción desconocida: $1" ;;
+      *) [ -z "$path" ] && path="$1" || die "sólo se admite una ruta"; shift ;;
+    esac
+  done
+  [ -n "$path" ] || die "uso: herd-site link <ruta> [opciones]"
+  [ -d "$path" ] || die "no existe el directorio: $path"
+  path=$(cd "$path" && pwd -P)
+
+  local user; user=$(id -un)
+  if [ -z "$name" ]; then
+    local base; base=$(sanitise "$(basename "$path")")
+    [ -n "$base" ] || base="app"
+    if [ "$namespace" = "1" ]; then
+      name=$(sanitise "$user-$base")
+    else
+      name="$base"
+    fi
+  else
+    name=$(sanitise "$name")
+  fi
+  [ -n "$name" ] || die "no se pudo derivar el nombre del sitio"
+
+  if [ -z "$php" ]; then
+    php=$(herdyml_lookup "$path" php 2>/dev/null || true)
+    [ -n "$php" ] || php=$(default_php)
+  fi
+
+  if [ -z "$https" ]; then
+    local secured; secured=$(herdyml_lookup "$path" secured 2>/dev/null || true)
+    [ "$secured" = "true" ] && https="1"
+  fi
+
+  if [ -L "$SITES_DIR/$name" ] || [ -f "$NGINX_DIR/$name.$TLD" ]; then
+    local current; current=$(readlink "$SITES_DIR/$name" 2>/dev/null || echo "")
+    if [ "$current" != "$path" ] && [ "$force" != "1" ]; then
+      die "ya existe el sitio '$name' apuntando a ${current:-¿?}
+  → usa otro --name, o --force para reemplazarlo"
+    fi
+  fi
+
+  say "Publicando $path"
+  say "  sitio: $name.$TLD   php: $php   https: ${https:-0}"
+
+  local args=(link --path "$path" --name "$name" --php "$php")
+  [ "$https" = "1" ] && args+=(--https)
+  sudo_core "${args[@]}" || exit $?
+  say ""
+  say "Listo. Desde este Mac:  http${https:+s}://$name.$TLD"
+}
+
+cmd_unlink() {
+  local name="" purge="0"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      --purge) purge="1"; shift ;;
+      *) [ -z "$name" ] && name="$1" || die "sólo se admite un sitio"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "uso: herd-site unlink <host>"
+  name=$(sanitise "$name")
+  sudo_core unlink --name "$name"
+}
+
+owner_from_path() {  # /Users/vyrglobal/x -> vyrglobal
+  case "$1" in
+    /Users/*/*) printf '%s' "$1" | sed 's#^/Users/##' | cut -d/ -f1 ;;
+    *) printf '%s' "-" ;;
+  esac
+}
+
+vhost_php() {  # $1 = nombre del sitio
+  local v
+  v=$(grep -m1 -E "^# ISOLATED_PHP_VERSION=" "$NGINX_DIR/$1.$TLD" 2>/dev/null | sed 's/.*=//')
+  case "$v" in
+    [0-9][0-9]) v="${v%?}.${v#?}" ;;
+  esac
+  printf '%s' "${v:--}"
+}
+
+vhost_https() {  # $1 = nombre del sitio
+  if grep -q "443 ssl" "$NGINX_DIR/$1.$TLD" 2>/dev/null; then printf 'si'; else printf 'no'; fi
+}
+
+# Vista por usuario: los sitios publicados por el usuario actual.
+# Con --all muestra los de todo el Mac.
+cmd_links() {
+  local all="0" user name path php https owner link seen=""
+  [ "${1:-}" = "--all" ] && all="1"
+  user=$(id -un)
+  printf '%-38s %-44s %-10s %-5s %s\n' SITIO RUTA DUEÑO PHP HTTPS
+  # sitios gestionados por herd-site (manifiesto)
+  if [ -f "$MANIFEST" ]; then
+    while IFS=$'\t' read -r name path php https owner; do
+      [ -n "$name" ] || continue
+      [ -n "$owner" ] || owner=$(owner_from_path "$path")
+      seen="$seen $name"
+      [ "$all" = "0" ] && [ "$owner" != "$user" ] && continue
+      case "$https" in 1) https="si" ;; 0|"") https="no" ;; esac
+      printf '%-38s %-44s %-10s %-5s %s\n' "$name.$TLD" "$path" "$owner" "${php:--}" "$https"
+    done < "$MANIFEST"
+  fi
+  # enlaces nativos de Herd (herd link), que no están en el manifiesto
+  for link in "$SITES_DIR"/*; do
+    [ -L "$link" ] || continue
+    name=$(basename "$link")
+    case " $seen " in *" $name "*) continue ;; esac
+    path=$(readlink "$link")
+    owner=$(owner_from_path "$path")
+    [ "$owner" = "-" ] && owner="$HERD_USER"
+    [ "$all" = "0" ] && [ "$owner" != "$user" ] && continue
+    printf '%-38s %-44s %-10s %-5s %s\n' "$name.$TLD" "$path" "$owner" "$(vhost_php "$name")" "$(vhost_https "$name")"
+  done
+}
+
+cmd_list() {
+  local vhost path ver
+  printf '%-34s %-46s %-6s %s\n' SITIO RUTA PHP HTTPS
+  for vhost in "$NGINX_DIR"/*."$TLD"; do
+    [ -e "$vhost" ] || continue
+    name=$(basename "$vhost" | sed "s/\.$TLD$//")
+    path=$(readlink "$SITES_DIR/$name" 2>/dev/null || echo "-")
+    ver=$(grep -m1 -E "^# ISOLATED_PHP_VERSION=" "$vhost" 2>/dev/null | sed 's/.*=//')
+    case "$ver" in
+      [0-9][0-9]) ver="${ver%?}.${ver#?}" ;;
+    esac
+    https="no"
+    grep -q "443 ssl" "$vhost" 2>/dev/null && https="si"
+    printf '%-34s %-46s %-6s %s\n' "$name.$TLD" "$path" "$ver" "$https"
+  done
+}
+
+cmd_versions() {
+  local v
+  printf 'PHP disponibles en el Herd compartido:\n'
+  for v in $(installed_php); do
+    if [ -x "$SHARED_PHP/$(printf '%s' "${v//./}")/php" ]; then
+      printf '  %-5s  fpm: %s  cli: /opt/homebrew/bin/php%s\n' "$v" "$(printf '%s' "${v//./}")" "$(printf '%s' "${v//./}")"
+    else
+      printf '  %-5s  fpm: %s  cli: (no expuesta)\n' "$v" "$(printf '%s' "${v//./}")"
+    fi
+  done
+}
+
+cmd_certs() {
+  local refresh="0"
+  [ "${1:-}" = "--refresh" ] && refresh="1"
+  sudo_core certs $([ "$refresh" = "1" ] && echo --refresh)
+}
+
+cmd_reapply() {
+  say "Regenerando los vhosts con la configuración actual de Herd..."
+  sudo_core reapply
+}
+
+cmd_doctor() {
+  sudo_core doctor
+}
+
+# Autodiagnóstico: comprueba de principio a fin que el usuario puede
+# publicar un proyecto (necesita la regla sudoers ya instalada).
+cmd_selftest() {
+  local user dir name fails=0 real
+  user=$(id -un)
+  # el directorio va en el home del usuario: el núcleo bloquea /tmp y /var/folders.
+  # OJO: sin punto delante — los directorios ocultos no los resuelve server.php.
+  dir="$HOME/herd-selftest-$$"
+  rm -rf "$dir"
+  mkdir -p "$dir/public" "$dir/storage/framework/cache"
+  real=$(cd "$dir" && pwd -P)
+  name="selftest-$user-$$"
+
+  say "== Autodiagnóstico de $user =="
+  printf '<?php echo "PHP=".PHP_VERSION." uid=".(function_exists("posix_geteuid")?posix_geteuid():"?");' > "$dir/public/index.php"
+  printf 'name: %s\nphp: '"'"'7.4'"'"'\nsecured: false\n' "$name" > "$dir/herd.yml"
+  printf '<?php @file_put_contents("%s/storage/framework/cache/t.txt","x"); echo file_exists("%s/storage/framework/cache/t.txt")?"write-ok":"write-fail";' "$real" "$real" > "$dir/public/w.php"
+
+  # 1) publicar
+  if ! sudo_core link --path "$real" --name "$name" --php 7.4 --https >/dev/null 2>&1; then
+    say "  [FALLO] no se pudo publicar (¿instalaste la regla sudoers?)"
+    sudo_core link --path "$real" --name "$name" --php 7.4 --https
+    rm -rf "$dir"
+    return 1
+  fi
+  say "  [OK] publicado $name.$TLD"
+
+  # 2) responde por HTTP con la versión de PHP pedida
+  #    (se reintenta: nginx tarda un instante en aplicar el vhost nuevo)
+  local body i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    body=$(curl -sL --max-time 8 "http://$name.$TLD/" 2>/dev/null)
+    case "$body" in PHP=7.4*) break ;; esac
+    sleep 1
+  done
+  case "$body" in
+    PHP=7.4*) say "  [OK] responde por HTTP ($body)" ;;
+    *) say "  [FALLO] no responde por HTTP: ${body:-sin respuesta}"; fails=$((fails+1)) ;;
+  esac
+
+  # 3) el php-fpm puede escribir en storage/ (permisos de grupo)
+  for i in 1 2 3 4 5; do
+    body=$(curl -sL --max-time 8 "http://$name.$TLD/w.php" 2>/dev/null)
+    case "$body" in write-ok|write-fail) break ;; esac
+    sleep 1
+  done
+  case "$body" in
+    write-ok) say "  [OK] php-fpm puede escribir en storage/" ;;
+    *) say "  [FALLO] php-fpm no puede escribir en storage/ ($body)"; fails=$((fails+1)) ;;
+  esac
+
+  # 4) visible desde la LAN
+  local ip
+  ip=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null)
+  if [ -n "$ip" ]; then
+    body=$(curl -sL --max-time 8 -H "Host: $name.$TLD" "http://$ip/" 2>/dev/null)
+    case "$body" in
+      PHP=7.4*) say "  [OK] visible desde la LAN ($ip)" ;;
+      *) say "  [AVISO] no responde desde la LAN ($ip): revisa el firewall" ;;
+    esac
+  fi
+
+  # 5) HTTPS con el certificado comodín
+  body=$(curl -sk --max-time 5 "https://$name.$TLD/" 2>/dev/null)
+  case "$body" in
+    PHP=7.4*) say "  [OK] HTTPS con el certificado comodín" ;;
+    *) say "  [AVISO] HTTPS no responde ($body)" ;;
+  esac
+
+  # limpieza
+  sudo_core unlink --name "$name" >/dev/null 2>&1
+  rm -rf "$dir"
+  say ""
+  [ "$fails" = "0" ] && say "Todo correcto." || say "$fails comprobación(es) fallida(s)."
+  return $fails
+}
+
+case "${1:-}" in
+  link) shift; cmd_link "$@" ;;
+  unlink) shift; cmd_unlink "$@" ;;
+  list) cmd_list ;;
+  links) shift; cmd_links "$@" ;;
+  versions) cmd_versions ;;
+  php-version)
+    dir="${2:-$PWD}"
+    resolve_php_version "$dir"
+    ;;
+  php) shift; cmd_php "$@" ;;
+  composer) shift; cmd_composer "$@" ;;
+  certs) shift; cmd_certs "$@" ;;
+  reapply) cmd_reapply ;;
+  doctor) cmd_doctor ;;
+  prune) sudo_core prune ;;
+  selftest) cmd_selftest ;;
+  reload) sudo_core reload ;;
+  -h|--help|help|"") usage ;;
+  *) usage; die "comando desconocido: $1" ;;
+esac

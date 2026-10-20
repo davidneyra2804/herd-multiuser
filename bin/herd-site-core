@@ -1,0 +1,697 @@
+#!/bin/bash
+# herd-site-core — núcleo privilegiado de herd-site.
+#
+# NO invocar directamente: se ejecuta como root a través de sudo desde
+# /opt/homebrew/bin/herd-site. Su superficie de ataque es deliberadamente
+# pequeña: sólo puede (1) registrar/quitar un sitio en el Herd compartido y
+# (2) recargar nginx. Valida en cada llamada quién pregunta y qué pide.
+#
+# sudo env: SUDO_USER / SUDO_UID  ->  usuario real que-launchó la petición.
+
+set -uo pipefail
+
+# Configuración: se lee del config.env del runtime compartido (lo escribe el
+# instalador) y si no existe se deduce del entorno. Así el mismo código
+# funciona en otro Mac con otro usuario propietario de Herd.
+SHARED="${SHARED:-/opt/homebrew/share/herd-shared}"
+[ -f "$SHARED/config.env" ] && . "$SHARED/config.env" 2>/dev/null
+
+HERD_USER="${HERD_USER:-$(id -un)}"
+HERD_HOME="${HERD_HOME:-/Users/$HERD_USER/Library/Application Support/Herd}"
+HERD_BIN="$HERD_HOME/bin/herd"
+SITES_DIR="$HERD_HOME/config/valet/Sites"
+NGINX_DIR="$HERD_HOME/config/valet/Nginx"
+PID_FILE="$HERD_HOME/bin/nginx.pid"
+CERTS_DIR="$SHARED/certs"
+MANIFEST="$SHARED/sites.tsv"
+TLD="${TLD:-backend.test}"
+GROUP="${GROUP:-staff}"
+ALLOWED_PHP="7.4 8.0 8.1 8.2 8.3 8.4 8.5 8.6"
+HERD_APP="${HERD_APP:-/Applications/Herd.app/Contents/Resources}"
+CA_DIR="$HERD_HOME/config/valet/CA"
+CA_PEM="$CA_DIR/LaravelValetCASelfSigned.pem"
+CA_KEY="$CA_DIR/LaravelValetCASelfSigned.key"
+WILD_CRT="$CERTS_DIR/$TLD.crt"
+WILD_KEY="$CERTS_DIR/$TLD.key"
+
+# ------------------------------------------------- partes de Herd que se leen
+# en tiempo de ejecución (para sobrevivir a una actualización de Herd):
+#   - server.php y su prefijo estático (UUID) pueden cambiar de versión.
+#   - el mapa de sockets ($herd_sock_XX) lo define la app en pro/nginx/debug.conf.
+
+valet_server_path() {
+  local p
+  for p in "$HERD_APP/valet/server.php" "$HERD_APP/valet/valet/server.php"; do
+    [ -f "$p" ] && { printf '%s' "$p"; return 0; }
+  done
+  # búsqueda de respaldo
+  p=$(find "$HERD_APP" -maxdepth 3 -name server.php 2>/dev/null | head -1)
+  [ -n "$p" ] && { printf '%s' "$p"; return 0; }
+  printf '%s' "/Applications/Herd.app/Contents/Resources/valet/server.php"
+}
+
+valet_static_prefix() {
+  local server uuid
+  server=$(valet_server_path)
+  uuid=$(grep -m1 -oE "VALET_STATIC_PREFIX',\s*'[0-9a-f-]+" "$server" 2>/dev/null | grep -oE "[0-9a-f-]{36}")
+  if [ -z "$uuid" ]; then
+    uuid=$(grep -m1 -oE "define\('VALET_STATIC_PREFIX',\s*'[^']+" "$server" 2>/dev/null | sed "s/.*'//")
+  fi
+  [ -n "$uuid" ] || uuid="41c270e4-5535-4daa-b23e-c269744c2f45"
+  printf '%s' "$uuid"
+}
+
+socket_ref() {  # $1 = versión -> expresión fastcgi_pass
+  local tag
+  tag=$(php_tag "$1")
+  if grep -qs "herd_sock_$tag" "$HERD_APP/config/pro/nginx/debug.conf" 2>/dev/null; then
+    printf '$herd_sock_%s' "$tag"
+  else
+    # el mapa de sockets cambió (o no existe): se usa la ruta directa
+    printf 'unix:%s/herd%s.sock' "$HERD_HOME" "$tag"
+  fi
+}
+
+# Raíces y componentes que nunca se pueden publicar por HTTP.
+BLOCKED_ROOTS="/System /usr /bin /sbin /etc /var /opt /private/etc /private/var/db /private/var/folders /private/var/root /dev /cores /Applications /Library /Network /Users/Shared/Library /Users/Shared/.ssh /Volumes/Preboot /Volumes/Recovery /Volumes/Update /Volumes/.Timemachine /Volumes/VM /Volumes/.AppleHFS"
+BLOCKED_NAMES=".ssh .gnupg .aws .azure .gcloud .kube .config .password-store .composer .m2 .docker .vscode .git-credentials .netrc .pgpass .my.cnf .npmrc .bash_history .zsh_history .gnupg .IdentityService .Trash Keychains Mail Messages"
+
+die() { printf 'herd-site-core: %s\n' "$1" >&2; exit "${2:-1}"; }
+say() { printf '%s\n' "$1"; }
+
+# ---------------------------------------------------------------- utilidades
+
+php_tag() {  # 7.4 -> 74
+  printf '%s' "${1//./}"
+}
+
+php_allowed() {
+  local v
+  for v in $ALLOWED_PHP; do [ "$v" = "$1" ] && return 0; done
+  return 1
+}
+
+php_installed() {  # ¿existe el fpm de esa versión en el Herd del host?
+  local t
+  t=$(php_tag "$1")
+  [ -x "$HERD_HOME/bin/php${t}-fpm" ]
+}
+
+default_php() {
+  "$HERD_HOME/bin/php" -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null
+}
+
+requester_ok() {
+  REQ_USER="${SUDO_USER:-}"
+  REQ_UID="${SUDO_UID:-}"
+  if [ "$(id -u)" = "0" ]; then
+    # modo root: exige que venga de sudo (para saber quién pregunta)
+    [ -n "$REQ_USER" ] || die "sin SUDO_USER: invocar siempre vía sudo desde herd-site"
+    id -u "$REQ_USER" >/dev/null 2>&1 || die "usuario desconocido: $REQ_USER"
+    return 0
+  fi
+  # modo propietario: sólo el dueño del Herd puede operar sin root
+  [ "$(id -un)" = "$HERD_USER" ] || die "sin privilegios: usa sudo (regla en /etc/sudoers.d/herd-site)"
+  REQ_USER="$HERD_USER"
+  REQ_UID="$(id -u)"
+}
+
+path_blocked() {  # $1 = ruta absoluta
+  local p="$1" comp root
+  case "$p" in
+    /*) ;;
+    *) return 0 ;;
+  esac
+  for root in $BLOCKED_ROOTS; do
+    case "$p" in
+      "$root"|"$root"/*) return 0 ;;
+    esac
+  done
+  # componentes sensibles en cualquier nivel
+  local IFS='/'
+  for comp in $p; do
+    case " $BLOCKED_NAMES " in
+      *" $comp "*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+path_ok_for_user() {  # el usuario real debe poder publicar esta ruta
+  local p="$1"
+  case "$p" in
+    "/Users/$REQ_USER"|"/Users/$REQ_USER"/*) return 0 ;;
+  esac
+  sudo -u "$REQ_USER" test -w "$p" 2>/dev/null
+}
+
+# ------------------------------------------------------------------ permisos
+
+apply_permissions() {  # $1 = raíz del proyecto
+  local root="$1" d
+  # grupo de trabajo: staff (todos los usuarios del Mac)
+  if [ "$(stat -f '%Sg' "$root" 2>/dev/null)" != "$GROUP" ]; then
+    chgrp -R "$GROUP" "$root" 2>/dev/null
+  fi
+  # lectura: nginx (agentmaster:staff) y php-fpm necesitan leer el código
+  find "$root" -type d ! -perm -g+x -exec chmod g+x {} + 2>/dev/null
+  find "$root" -type f ! -perm -g+r -exec chmod g+r {} + 2>/dev/null
+  # escritura: la app escribe en storage/, bootstrap/cache/, etc.
+  for d in storage bootstrap/cache public/build var/logs; do
+    [ -d "$root/$d" ] && chmod -R g+rwX "$root/$d" 2>/dev/null
+  done
+  [ -d "$root" ] && chmod g+s "$root" 2>/dev/null
+  # verificación: cada directorio de escritura debe permitir escritura al grupo
+  for d in storage bootstrap/cache; do
+    [ -d "$root/$d" ] || continue
+    find "$root/$d" -type d ! -perm -g+w -exec chmod g+w {} + 2>/dev/null
+    find "$root/$d" -type f ! -perm -g+w -exec chmod g+w {} + 2>/dev/null
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------- manifiesto
+# Registro de los sitios que gestiona herd-site, para poder regenerarlos
+# (reapply) y auditarlos (doctor) tras una actualización de Herd.
+
+manifest_add() {  # $1=nombre $2=ruta $3=php $4=https [$5=dueño]
+  local name="$1" path="$2" php="$3" https="$4" owner="${5:-$REQ_USER}" tmp
+  mkdir -p "$SHARED" 2>/dev/null
+  tmp=$(mktemp)
+  [ -f "$MANIFEST" ] && grep -v "^$name	" "$MANIFEST" > "$tmp" 2>/dev/null
+  printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$path" "$php" "$https" "$owner" >> "$tmp"
+  sort -o "$tmp" "$tmp"
+  install -m 644 -o "$HERD_USER" -g "$GROUP" "$tmp" "$MANIFEST"
+  rm -f "$tmp"
+}
+
+manifest_remove() {  # $1=nombre
+  local name="$1" tmp
+  [ -f "$MANIFEST" ] || return 0
+  tmp=$(mktemp)
+  grep -v "^$name	" "$MANIFEST" > "$tmp" 2>/dev/null
+  install -m 644 -o "$HERD_USER" -g "$GROUP" "$tmp" "$MANIFEST"
+  rm -f "$tmp"
+}
+
+manifest_list() {
+  [ -f "$MANIFEST" ] && cat "$MANIFEST"
+}
+
+# --------------------------------------------------------------------- nginx
+
+reload_nginx() {
+  # 1) recarga estándar: SIGHUP al master (funciona si somos root, que es lo
+  #    normal: el núcleo se ejecuta vía sudo). Es la vía fiable.
+  local pid
+  pid=$(cat "$PID_FILE" 2>/dev/null)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    if kill -HUP "$pid" 2>/dev/null; then
+      sleep 0.3
+      return 0
+    fi
+  fi
+  # 2) fallback: el helper de Herd. Sólo funciona si el PID que guarda
+  #    (.pid/nginx.pid) coincide con el master real; si está obsoleto sus
+  #    "restart" no hacen nada. Como ese fichero es nuestro, lo arreglamos.
+  local helper_pid
+  helper_pid=$(cat "$HERD_HOME/.pid/nginx.pid" 2>/dev/null)
+  if [ -n "$pid" ] && [ "$helper_pid" != "$pid" ]; then
+    printf '%s' "$pid" > "$HERD_HOME/.pid/nginx.pid" 2>/dev/null
+    helper_pid="$pid"
+  fi
+  if [ -n "$helper_pid" ] && [ "$helper_pid" = "$pid" ]; then
+    HOME="/Users/$HERD_USER" "$HERD_BIN" restart nginx >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+fpm_alive() {  # $1 = versión -> 0 si el php-fpm de esa versión está escuchando
+  local ver="$1" tag sock
+  tag=$(php_tag "$ver")
+  sock="$HERD_HOME/herd$tag.sock"
+  [ -S "$sock" ] || return 1
+  lsof "$sock" 2>/dev/null | grep -q "php"
+}
+
+fpm_reload_workers() {  # $1 = versión -> recarga gracefully el pool
+  # Necesario porque PHP cachea el realpath() de los symlinks de sitios
+  # (realpath_cache_ttl = 120 s): si se republica un sitio con el mismo
+  # nombre, los workers seguirían sirviendo el directorio anterior.
+  local ver="$1" pid
+  pid=$(pgrep -f "php-fpm: master process.*${ver}-fpm.conf" 2>/dev/null | head -1)
+  [ -n "$pid" ] || pid=$(pgrep -f "php${ver}-fpm" 2>/dev/null | head -1)
+  [ -n "$pid" ] || return 1
+  kill -USR2 "$pid" 2>/dev/null
+}
+
+ensure_fpm_running() {  # $1 = versión (7.4, 8.3, ...)
+  local ver="$1" tag sock bin conf
+  tag=$(php_tag "$ver")
+  sock="$HERD_HOME/herd$tag.sock"
+  bin="$HERD_HOME/bin/php$tag-fpm"
+  conf="$HERD_HOME/config/fpm/$ver-fpm.conf"
+  [ -x "$bin" ] || return 1
+  [ -f "$conf" ] || return 1
+  fpm_alive "$ver" && return 0
+  # arrancarlo (php-fpm corre en segundo plano por defecto)
+  nohup "$bin" -y "$conf" >> "$HERD_HOME/Log/php-fpm-$tag.log" 2>&1 &
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.5
+    fpm_alive "$ver" && return 0
+  done
+  return 1
+}
+
+NGINX_BIN="/Applications/Herd.app/Contents/Resources/nginx-arm64"
+NGINX_CONF="$HERD_HOME/config/nginx/nginx.conf"
+# prefijo propio para el "nginx -t" (no tocar el de Herd ni el CWD del usuario)
+TEST_PREFIX="$SHARED/nginx-test"
+
+config_ok() {  # 0 = válida, 1 = inválida, 2 = no se pudo comprobar
+  CONFIG_ERR=""
+  local out
+  # OJO: nginx -t crea el pid file y las carpetas *_temp en el PREFIJO.
+  # Sin -p usa el directorio actual (el proyecto del usuario) → hay que
+  # forzar un prefijo propio, y que no sea el de Herd (truncaría su nginx.pid).
+  mkdir -p "$TEST_PREFIX" 2>/dev/null
+  out=$("$NGINX_BIN" -t -p "$TEST_PREFIX" -c "$NGINX_CONF" 2>&1)
+  if printf '%s' "$out" | grep -q "syntax is ok"; then
+    return 0
+  fi
+  CONFIG_ERR=$(printf '%s\n' "$out" | grep -E "emerg|error" | head -3)
+  # sin permiso para abrir el log no se puede validar (no es un error de config)
+  if printf '%s' "$CONFIG_ERR" | grep -q "Permission denied"; then
+    return 2
+  fi
+  return 1
+}
+
+nginx_alive() {
+  local pid
+  pid=$(cat "$PID_FILE" 2>/dev/null)
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+site_responds() {  # $1 = nombre de sitio (reintenta: nginx tarda un instante en recargar)
+  local code i
+  for i in 1 2 3 4 5; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+          -H "Host: $1.$TLD" "http://127.0.0.1/" 2>/dev/null)
+    if [ -n "$code" ] && [ "$code" != "000" ]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+write_vhost() {  # $1=site $2=versión php $3=1|0 https
+  local site="$1" ver="$2" https="$3" tag tmp
+  local VALET_SERVER VALET_PREFIX SOCK_REF
+  tag=$(php_tag "$ver")
+  VALET_SERVER=$(valet_server_path)
+  VALET_PREFIX=$(valet_static_prefix)
+  SOCK_REF=$(socket_ref "$ver")
+  tmp=$(mktemp)
+
+  if [ "$https" = "1" ]; then
+    {
+      printf '# ISOLATED_PHP_VERSION=%s\n' "$ver"
+      printf 'server {\n'
+      printf '    listen 0.0.0.0:80;\n'
+      printf '    listen 127.0.0.1:80;\n'
+      printf '    server_name %s.%s www.%s.%s *.%s.%s;\n' "$site" "$TLD" "$site" "$TLD" "$site" "$TLD"
+      printf '    return 301 https://$host$request_uri;\n'
+      printf '}\n\n'
+      printf 'server {\n'
+      printf '    listen 0.0.0.0:443 ssl;\n'
+      printf '    listen 127.0.0.1:443 ssl;\n'
+      printf '    server_name %s.%s www.%s.%s *.%s.%s;\n' "$site" "$TLD" "$site" "$TLD" "$site" "$TLD"
+      printf '    root /;\n'
+      printf '    charset utf-8;\n'
+      printf '    client_max_body_size 1024M;\n'
+      printf '    http2 on;\n\n'
+      printf '    location /%s/ {\n' "$VALET_PREFIX"
+      printf '        internal;\n'
+      printf '        alias /;\n'
+      printf '        try_files $uri $uri/;\n'
+      printf '    }\n\n'
+      printf '    ssl_certificate "%s";\n' "$WILD_CRT"
+      printf '    ssl_certificate_key "%s";\n\n' "$WILD_KEY"
+      printf '    location / {\n'
+      printf '        rewrite ^ "%s" last;\n' "$VALET_SERVER"
+      printf '    }\n\n'
+      printf '    access_log off;\n'
+      printf '    error_log "%s/Log/nginx-error.log";\n\n' "$HERD_HOME"
+      printf '    error_page 404 "%s";\n\n' "$VALET_SERVER"
+      printf '    location ~ [^/]\\.php(/|$) {\n'
+      printf '        fastcgi_split_path_info ^(.+\\.php)(/.+)$;\n'
+      printf '        fastcgi_pass %s;\n' "$SOCK_REF"
+      printf '        fastcgi_index "%s";\n' "$VALET_SERVER"
+      printf '        include fastcgi_params;\n'
+      printf '        fastcgi_param SCRIPT_FILENAME "%s";\n' "$VALET_SERVER"
+      printf '        fastcgi_param HERD_HOME "%s";\n' "$HERD_HOME"
+      printf '        fastcgi_param PATH_INFO $fastcgi_path_info;\n'
+      printf '    }\n\n'
+      printf '    location ~ /\\.ht {\n'
+      printf '        deny all;\n'
+      printf '    }\n'
+      printf '}\n'
+    } > "$tmp"
+  else
+    {
+      printf '# ISOLATED_PHP_VERSION=%s\n' "$ver"
+      printf 'server {\n'
+      printf '    listen 0.0.0.0:80;\n'
+      printf '    listen 127.0.0.1:80;\n'
+      printf '    server_name %s.%s www.%s.%s *.%s.%s;\n' "$site" "$TLD" "$site" "$TLD" "$site" "$TLD"
+      printf '    root /;\n'
+      printf '    charset utf-8;\n'
+      printf '    client_max_body_size 1024M;\n\n'
+      printf '    location /%s/ {\n' "$VALET_PREFIX"
+      printf '        internal;\n'
+      printf '        alias /;\n'
+      printf '        try_files $uri $uri/;\n'
+      printf '    }\n\n'
+      printf '    location / {\n'
+      printf '        rewrite ^ "%s" last;\n' "$VALET_SERVER"
+      printf '    }\n\n'
+      printf '    access_log off;\n'
+      printf '    error_log "%s/Log/nginx-error.log";\n\n' "$HERD_HOME"
+      printf '    error_page 404 "%s";\n\n' "$VALET_SERVER"
+      printf '    location ~ [^/]\\.php(/|$) {\n'
+      printf '        fastcgi_split_path_info ^(.+\\.php)(/.+)$;\n'
+      printf '        fastcgi_pass %s;\n' "$SOCK_REF"
+      printf '        fastcgi_index "%s";\n' "$VALET_SERVER"
+      printf '        include fastcgi_params;\n'
+      printf '        fastcgi_param SCRIPT_FILENAME "%s";\n' "$VALET_SERVER"
+      printf '        fastcgi_param HERD_HOME "%s";\n' "$HERD_HOME"
+      printf '        fastcgi_param PATH_INFO $fastcgi_path_info;\n'
+      printf '    }\n\n'
+      printf '    location ~ /\\.ht {\n'
+      printf '        deny all;\n'
+      printf '    }\n'
+      printf '}\n'
+    } > "$tmp"
+  fi
+
+  # escritura atómica: el fichero completo aparece de golpe en el directorio
+  # que vigila el LaunchAgent (evita recargas con un vhost a medias)
+  local tmpv="$NGINX_DIR/.$site.$TLD.tmp.$$"
+  install -m 664 -o "$HERD_USER" -g "$GROUP" "$tmp" "$tmpv"
+  mv -f "$tmpv" "$NGINX_DIR/$site.$TLD"
+  rm -f "$tmp"
+}
+
+ensure_wildcard_cert() {  # $1 = force (1 = regenerar)
+  if [ "${1:-0}" != "1" ]; then
+    [ -f "$WILD_CRT" ] && [ -f "$WILD_KEY" ] && return 0
+  fi
+  [ -f "$CA_PEM" ] && [ -f "$CA_KEY" ] || return 1
+  mkdir -p "$CERTS_DIR"
+  local ips="" ip
+  for ip in $(ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -v '^127\.'); do
+    ips="$ips,IP:$ip"
+  done
+  local tmpd
+  tmpd=$(mktemp -d)
+  cat > "$tmpd/ext.cnf" <<EOF
+[v3]
+basicConstraints = CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:$TLD,DNS:*.$TLD,IP:127.0.0.1${ips}
+EOF
+  openssl req -new -newkey rsa:2048 -nodes \
+    -keyout "$tmpd/key.pem" -out "$tmpd/csr.pem" \
+    -subj "/CN=$TLD" 2>/dev/null &&
+  openssl x509 -req -in "$tmpd/csr.pem" -CA "$CA_PEM" -CAkey "$CA_KEY" \
+    -CAcreateserial -out "$tmpd/crt.pem" -days 825 -sha256 \
+    -extfile "$tmpd/ext.cnf" -extensions v3 2>/dev/null &&
+  install -m 644 -o "$HERD_USER" -g "$GROUP" "$tmpd/crt.pem" "$WILD_CRT" &&
+  install -m 640 -o "$HERD_USER" -g "$GROUP" "$tmpd/key.pem" "$WILD_KEY"
+  rm -rf "$tmpd"
+  [ -f "$WILD_CRT" ]
+}
+
+# ------------------------------------------------------------------ acciones
+
+cmd_link() {
+  local path="" name="" php="" https="0"
+  # todo se ejecuta desde el home de Herd: nada debe caer en el directorio
+  # del proyecto desde el que ha llamado el usuario
+  cd "$HERD_HOME" 2>/dev/null || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --path) path="$2"; shift 2 ;;
+      --name) name="$2"; shift 2 ;;
+      --php) php="$2"; shift 2 ;;
+      --https) https="1"; shift ;;
+      *) die "argumento desconocido: $1" ;;
+    esac
+  done
+
+  [ -n "$path" ] || die "falta --path"
+  [ -d "$path" ] || die "no es un directorio: $path"
+  path=$(cd "$path" 2>/dev/null && pwd -P) || die "no se puede resolver: $path"
+  path_blocked "$path" && die "ruta bloqueada por política: $path"
+  path_ok_for_user "$path" || die "$REQ_USER no tiene permisos sobre $path"
+
+  [ -n "$name" ] || die "falta --name"
+  case "$name" in
+    [a-z0-9]*) ;;
+    *) die "nombre de sitio inválido: $name" ;;
+  esac
+  case "$name" in
+    *[!a-z0-9-]*) die "nombre de sitio inválido: $name" ;;
+  esac
+  [ "${#name}" -le 48 ] || die "nombre de sitio demasiado largo"
+
+  if [ -z "$php" ]; then php=$(default_php); fi
+  php_allowed "$php" || die "versión de PHP no permitida: $php"
+  php_installed "$php" || die "PHP $php no está instalado en el Herd del host"
+
+  if [ "$https" = "1" ]; then
+    ensure_wildcard_cert || die "no se pudo emitir el certificado para *.$TLD"
+  fi
+
+  # registro del sitio (symlink) + vhost
+  mkdir -p "$SITES_DIR" "$NGINX_DIR"
+  local previous=""
+  [ -L "$SITES_DIR/$name" ] && previous=$(readlink "$SITES_DIR/$name")
+  ln -sfn "$path" "$SITES_DIR/$name"
+  chown -h "$HERD_USER:$GROUP" "$SITES_DIR/$name"
+  chmod 775 "$SITES_DIR" "$NGINX_DIR"
+
+  apply_permissions "$path"
+  # el pool de php-fpm de esa versión debe estar en marcha (si no, 502)
+  if ! ensure_fpm_running "$php"; then
+    say "AVISO: no se pudo arrancar el php-fpm $php; el sitio dará 502 hasta que Herd lo levante"
+  fi
+  # se guarda la versión anterior del vhost por si la nueva config no valida
+  local vhost="$NGINX_DIR/$name.$TLD" backup="" rc=0
+  [ -f "$vhost" ] && { backup=$(mktemp); cp -f "$vhost" "$backup"; }
+  write_vhost "$name" "$php" "$https"
+
+  config_ok; rc=$?
+  if [ "$rc" = "1" ]; then
+    # config inválida: se restaura el vhost anterior y no se recarga
+    if [ -n "$backup" ]; then cp -f "$backup" "$vhost"; rm -f "$backup"; else rm -f "$vhost"; fi
+    die "la configuración de nginx no valida; no se recargó:
+$CONFIG_ERR"
+  fi
+
+  reload_nginx || die "sitio registrado pero nginx no se pudo recargar"
+
+  # si el sitio apuntaba a otro directorio, los workers del fpm tienen
+  # cacheado el realpath anterior: se recargan para que se sirva ya el nuevo
+  if [ -n "$previous" ] && [ "$previous" != "$path" ]; then
+    fpm_reload_workers "$php"
+  fi
+
+  # comprobación de salud: si nginx no responde, se revierte el vhost
+  if [ "$rc" = "2" ] || ! site_responds "$name"; then
+    if [ -n "$backup" ]; then
+      cp -f "$backup" "$vhost"
+      rm -f "$backup"
+      reload_nginx
+      die "nginx no responde tras la recarga; se restauró el vhost anterior"
+    fi
+  fi
+  [ -n "$backup" ] && rm -f "$backup"
+
+  manifest_add "$name" "$path" "$php" "$https"
+
+  say "OK $name"
+  if [ "$https" = "1" ]; then
+    say "URL   https://$name.$TLD"
+  else
+    say "URL   http://$name.$TLD"
+  fi
+  say "Ruta  $path"
+  say "PHP   $php"
+}
+
+cmd_unlink() {
+  local name="" purge="0"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      --purge) purge="1"; shift ;;
+      *) die "argumento desconocido: $1" ;;
+    esac
+  done
+  [ -n "$name" ] || die "falta --name"
+  case "$name" in *[!a-z0-9-]*) die "nombre de sitio inválido: $name" ;; esac
+
+  local removed=0
+  if [ -L "$SITES_DIR/$name" ]; then
+    rm -f "$SITES_DIR/$name" && removed=1
+  fi
+  if [ -f "$NGINX_DIR/$name.$TLD" ]; then
+    rm -f "$NGINX_DIR/$name.$TLD" && removed=1
+  fi
+  [ "$removed" = "1" ] || die "el sitio $name no existe"
+  manifest_remove "$name"
+  reload_nginx || die "sitio eliminado pero nginx no se pudo recargar"
+  say "OK $name eliminado"
+}
+
+cmd_reload() {
+  reload_nginx || die "no se pudo recargar nginx"
+  say "OK nginx recargado"
+}
+
+cmd_certs() {
+  local refresh="0"
+  [ "${1:-}" = "--refresh" ] && refresh="1"
+  ensure_wildcard_cert "$refresh" || die "no se pudo emitir el certificado para *.$TLD"
+  say "OK certificado *.$TLD en $WILD_CRT"
+}
+
+cmd_install_sudoers() {
+  local f="/etc/sudoers.d/herd-site"
+  cat > "$f" <<EOF
+# Permite publicar/quitar sitios en el Herd compartido sin contraseña de root.
+# El núcleo (/opt/homebrew/libexec/herd-site-core) valida cada petición.
+%staff ALL=(root) NOPASSWD: /opt/homebrew/libexec/herd-site-core
+EOF
+  chmod 440 "$f"
+  chown root:wheel "$f"
+  visudo -c -f "$f" >/dev/null 2>&1 || { rm -f "$f"; die "regla sudoers inválida"; }
+  say "OK regla sudoers instalada en $f"
+}
+
+cmd_reapply() {
+  local n=0 name path php https vhost backup
+  [ -f "$MANIFEST" ] || die "no hay sitios gestionados por herd-site"
+  local backups
+  backups=$(mktemp -d)
+  while IFS=$'\t' read -r name path php https; do
+    [ -n "$name" ] || continue
+    if [ ! -d "$path" ]; then
+      say "  $name: se omite (ya no existe $path)"
+      continue
+    fi
+    vhost="$NGINX_DIR/$name.$TLD"
+    [ -f "$vhost" ] && cp -f "$vhost" "$backups/$name.$TLD"
+    ensure_fpm_running "$php" >/dev/null 2>&1
+    write_vhost "$name" "$php" "$https"
+    n=$((n+1))
+  done < "$MANIFEST"
+
+  if ! config_ok; then
+    # se restauran los vhosts anteriores: mejor quedarse como estaba
+    for vhost in "$NGINX_DIR"/*."$TLD"; do
+      [ -e "$vhost" ] || continue
+      b=$(basename "$vhost")
+      [ -f "$backups/$b" ] && cp -f "$backups/$b" "$vhost"
+    done
+    rm -rf "$backups"
+    die "la configuración no valida; no se recargó nada:
+$CONFIG_ERR"
+  fi
+  rm -rf "$backups"
+  reload_nginx || die "no se pudo recargar nginx"
+  say "OK: $n vhost(s) regenerados con la configuración actual de Herd"
+}
+
+cmd_prune() {
+  local n=0 name path php https tmp
+  [ -f "$MANIFEST" ] || die "no hay manifiesto"
+  tmp=$(mktemp)
+  while IFS=$'\t' read -r name path php https; do
+    [ -n "$name" ] || continue
+    if [ -d "$path" ] && [ -L "$SITES_DIR/$name" ]; then
+      printf '%s\t%s\t%s\t%s\n' "$name" "$path" "$php" "$https" >> "$tmp"
+    else
+      say "  $name: el sitio ya no existe, se quita del manifiesto"
+      n=$((n+1))
+    fi
+  done < "$MANIFEST"
+  install -m 644 -o "$HERD_USER" -g "$GROUP" "$tmp" "$MANIFEST"
+  rm -f "$tmp"
+  say "OK: $n entrada(s) eliminadas"
+}
+
+cmd_doctor() {
+  local problems=0 name path php https vhost uuid_current uuid_vhost sock
+  uuid_current=$(valet_static_prefix)
+  say "Herd: $(HOME="/Users/$HERD_USER" "$HERD_BIN" --version 2>/dev/null | tail -1)"
+  say "prefijo estático: $uuid_current"
+  say ""
+  say "SITIO                          PHP   HTTPS  ESTADO"
+  while IFS=$'\t' read -r name path php https; do
+    [ -n "$name" ] || continue
+    local state="ok" detail=""
+    vhost="$NGINX_DIR/$name.$TLD"
+    if [ ! -f "$vhost" ]; then
+      state="falta vhost"; detail="reejecutar: herd-site reapply"
+    else
+      grep -q "listen 0.0.0.0:80;" "$vhost" || { state="sin LAN"; detail="falta listen 0.0.0.0"; }
+      grep -q "listen 127.0.0.1:80;" "$vhost" || { state="sin local"; detail="falta listen 127.0.0.1"; }
+      vhost_php=$(grep -m1 -E "^# ISOLATED_PHP_VERSION=" "$vhost" | sed 's/.*=//')
+      [ "$vhost_php" = "$php" ] || { state="php distinta"; detail="manifiesto=$php vhost=$vhost_php"; }
+      uuid_vhost=$(grep -m1 -oE "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" "$vhost")
+      [ "$uuid_vhost" = "$uuid_current" ] || { state="uuid obsoleto"; detail="reaplicar"; }
+      sock=$(socket_ref "$php")
+      case "$sock" in
+        '$herd_sock_'*) grep -qs "${sock#\$}" "$HERD_APP/config/pro/nginx/debug.conf" || { state="socket sin mapa"; detail="reaplicar"; } ;;
+      esac
+      if [ "$https" = "1" ] && [ ! -f "$WILD_CRT" ]; then
+        state="sin cert"; detail="herd-site certs"
+      fi
+    fi
+    if [ -L "$SITES_DIR/$name" ]; then
+      local target; target=$(readlink "$SITES_DIR/$name")
+      [ "$target" = "$path" ] || { state="symlink != manifiesto"; detail="reaplicar"; }
+    else
+      state="sin symlink"; detail="reaplicar"
+    fi
+    if ! fpm_alive "$php"; then
+      state="fpm parado"; detail="herd-site link para arrancarlo"
+    fi
+    case "$state" in
+      ok) ;;
+      *) problems=$((problems+1)) ;;
+    esac
+    printf '%-30s %-5s %-6s %s %s\n' "$name" "$php" "$https" "$state" "$detail"
+  done < "$MANIFEST"
+  say ""
+  [ "$problems" = "0" ] && say "Todo correcto." || say "$problems sitio(s) con incidencias (ver detalle)."
+  return 0
+}
+
+case "${1:-}" in
+  link) shift; requester_ok; cmd_link "$@" ;;
+  unlink) shift; requester_ok; cmd_unlink "$@" ;;
+  reload) shift; requester_ok; cmd_reload "$@" ;;
+  certs) shift; requester_ok; cmd_certs "$@" ;;
+  reapply) shift; requester_ok; cmd_reapply "$@" ;;
+  prune) shift; requester_ok; cmd_prune "$@" ;;
+  doctor) shift; requester_ok; cmd_doctor "$@" ;;
+  --install-sudoers) requester_ok; cmd_install_sudoers ;;
+  *) die "uso: herd-site-core {link|unlink|reload|certs|reapply|doctor|prune|--install-sudoers} ..." ;;
+esac

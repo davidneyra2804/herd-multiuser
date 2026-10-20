@@ -1,0 +1,321 @@
+#!/bin/bash
+# herd-shared-setup — deja el Mac con un Herd compartido por todos los usuarios.
+#
+#   /opt/homebrew/libexec/herd-shared-setup            -> parte de agentmaster (sin sudo)
+#   sudo /opt/homebrew/libexec/herd-shared-setup --root -> parte de root (sudoers, firewall)
+#
+# Lo que instala la parte sin sudo:
+#   /opt/homebrew/share/herd-shared/php/<ver>/{php,php-fpm,php.ini}
+#   /opt/homebrew/bin/php74 php83 php84 php85 php composer
+#   /Users/agentmaster/Library/LaunchAgents/com.herd.multiusuario.reload.plist
+#
+# Lo que instala la parte con sudo:
+#   /etc/sudoers.d/herd-site   (publicar/quitar sitios sin contraseña)
+#   excepción de firewall para nginx (si el firewall está activo)
+
+set -uo pipefail
+
+HERD_APP="${HERD_APP:-/Applications/Herd.app/Contents/Resources}"
+SHARED="${SHARED:-/opt/homebrew/share/herd-shared}"
+[ -f "$SHARED/config.env" ] && . "$SHARED/config.env" 2>/dev/null
+HERD_USER="${HERD_USER:-$(id -un)}"
+HERD_HOME="${HERD_HOME:-/Users/$HERD_USER/Library/Application Support/Herd}"
+SHARED="/opt/homebrew/share/herd-shared"
+SHARED_PHP="$SHARED/php"
+BIN="/opt/homebrew/bin"
+LIBEXEC="/opt/homebrew/libexec"
+TLD="backend.test"
+LAUNCH_AGENT="/Users/$HERD_USER/Library/LaunchAgents/com.herd.multiusuario.reload.plist"
+
+say()  { printf '  %s\n' "$1"; }
+step() { printf '\n== %s\n' "$1"; }
+die()  { printf 'error: %s\n' "$1" >&2; exit 1; }
+
+# versiones de PHP disponibles en el Herd del host (se detectan)
+detect_versions() {
+  local f v
+  for f in "$HERD_HOME"/bin/php[0-9][0-9]-fpm; do
+    [ -e "$f" ] || continue
+    v=$(basename "$f"); v=${v#php}; v=${v%-fpm}
+    case "$v" in
+      74) echo 74 ;; 80) echo 80 ;; 81) echo 81 ;; 82) echo 82 ;;
+      83) echo 83 ;; 84) echo 84 ;; 85) echo 85 ;; 86) echo 86 ;;
+    esac
+  done
+}
+VERSIONS="$(detect_versions)"
+
+# ------------------------------------------------------------------ runtime
+
+write_config() {
+  step "Configuración"
+  mkdir -p "$SHARED"
+  cat > "$SHARED/config.env" <<EOF
+# Configuración del Herd compartido. Lo genera el instalador.
+HERD_USER="$HERD_USER"
+HERD_HOME="$HERD_HOME"
+TLD="${TLD:-backend.test}"
+GROUP="${GROUP:-staff}"
+EOF
+  chmod 644 "$SHARED/config.env"
+  say "$SHARED/config.env"
+}
+
+install_shared_php() {
+  step "Runtime PHP compartido"
+  mkdir -p "$SHARED_PHP" || die "no se pudo crear $SHARED_PHP"
+  chmod 775 "$SHARED"
+
+  local tag ver src dst
+  for tag in $VERSIONS; do
+    ver=$(printf '%s' "$tag" | sed -E 's/^(.)(.)/\1.\2/')
+    src="$HERD_HOME/bin/php$tag"
+    dst="$SHARED_PHP/$tag"
+    [ -x "$src" ] || { say "php$tag no está en el Herd del host, se omite"; continue; }
+    mkdir -p "$dst/scandir"
+    cp -f "$src" "$dst/php"
+    cp -f "$HERD_HOME/bin/php$tag-fpm" "$dst/php-fpm" 2>/dev/null
+    chmod 755 "$dst/php" "$dst/php-fpm" 2>/dev/null
+    # ini: copia del de Herd, con la ruta del CA bundle apuntando al compartido.
+    # Se quitan la extensión de Herd y el auto_prepend_file (son features del
+    # dashboard y del Xdebug de Herd; además el PHP compilado por Herd ignora
+    # PHP_INI_SCAN_DIR, así que si se dejaran se cargarían dos veces).
+    if [ -f "$HERD_HOME/config/php/$tag/php.ini" ]; then
+      sed -e "s#$HERD_HOME/config/php/cacert.pem#$SHARED/cacert.pem#g" \
+          -e "/^extension=/d" -e "/^auto_prepend_file=/d" \
+          "$HERD_HOME/config/php/$tag/php.ini" > "$dst/php.ini"
+    else
+      printf 'memory_limit=512M\nupload_max_filesize=100M\npost_max_size=100M\n' > "$dst/php.ini"
+    fi
+    chmod 644 "$dst/php.ini"
+    # bundle de CA para curl/openssl
+    [ -f "$HERD_HOME/config/php/cacert.pem" ] && cp -f "$HERD_HOME/config/php/cacert.pem" "$SHARED/cacert.pem"
+    chmod 644 "$SHARED/cacert.pem" 2>/dev/null
+    say "PHP $ver -> $dst"
+  done
+}
+
+install_wrappers() {
+  step "Wrappers de PHP y Composer"
+  local tag ver
+  for tag in $VERSIONS; do
+    ver=$(printf '%s' "$tag" | sed -E 's/^(.)(.)/\1.\2/')
+    [ -x "$SHARED_PHP/$tag/php" ] || continue
+    cat > "$BIN/php$tag" <<EOF
+#!/bin/bash
+# php$tag — PHP $ver del Herd compartido (todos los usuarios del Mac).
+export PHP_INI_SCAN_DIR="$SHARED_PHP/$tag/scandir"
+exec "$SHARED_PHP/$tag/php" -c "$SHARED_PHP/$tag/php.ini" "\$@"
+EOF
+    chmod 755 "$BIN/php$tag"
+    say "php$tag (PHP $ver)"
+  done
+
+  # `php` sólo si no existe (Homebrew ya trae el suyo, que es el 8.5 = default de Herd)
+  if [ ! -e "$BIN/php" ]; then
+    cat > "$BIN/php" <<EOF
+#!/bin/bash
+# php — versión por defecto del Herd compartido.
+v=\$("$HERD_HOME/bin/php" -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null)
+tag=\${v//./}
+export PHP_INI_SCAN_DIR="$SHARED_PHP/\$tag/scandir"
+exec "$SHARED_PHP/\$tag/php" -c "$SHARED_PHP/\$tag/php.ini" "\$@"
+EOF
+    chmod 755 "$BIN/php"
+    say "php (default)"
+  else
+    say "php ya existe (Homebrew) -> no se toca; usa php74/php83/php84/php85"
+  fi
+
+  # el phar de composer: se copia el de Herd (el mismo que usa 'herd composer')
+  # para que las versiones coincidan; si no está, el de Homebrew.
+  if [ -f "$HERD_HOME/bin/composer" ]; then
+    cp -f "$HERD_HOME/bin/composer" "$BIN/composer.phar"
+    say "composer.phar (de Herd) copiado a $BIN/composer.phar"
+  elif [ -f /opt/homebrew/Cellar/composer/*/bin/composer ]; then
+    cp -f /opt/homebrew/Cellar/composer/*/bin/composer "$BIN/composer.phar"
+    say "composer.phar (de Homebrew) copiado a $BIN/composer.phar"
+  else
+    rm -f "$BIN/composer.phar"
+    say "AVISO: no se encontró el phar de composer"
+  fi
+  chmod 644 "$BIN/composer.phar" 2>/dev/null
+
+  # composer que elige la versión según el herd.yml del proyecto
+  cat > "$BIN/herd-composer" <<EOF
+#!/bin/bash
+# herd-composer — composer con la versión de PHP del proyecto (alias de
+# 'herd-site composer'). Se conserva por compatibilidad.
+exec "$BIN/herd-site" composer "\$@"
+EOF
+  chmod 755 "$BIN/herd-composer"
+  say "herd-composer (elige versión según herd.yml)"
+
+  for tag in $VERSIONS; do
+    ver=$(printf '%s' "$tag" | sed -E 's/^(.)(.)/\1.\2/')
+    [ -x "$SHARED_PHP/$tag/php" ] || continue
+    cat > "$BIN/composer$tag" <<EOF
+#!/bin/bash
+# composer$tag — composer con PHP $ver.
+export PHP_INI_SCAN_DIR="$SHARED_PHP/$tag/scandir"
+exec "$SHARED_PHP/$tag/php" "$BIN/composer.phar" "\$@"
+EOF
+    chmod 755 "$BIN/composer$tag"
+  done
+  say "composer74/composer83/composer84/composer85"
+}
+
+install_launch_agent() {
+  step "Recarga automática de nginx (launchd)"
+  cat > "$LIBEXEC/herd-site-reload" <<EOF
+#!/bin/bash
+# Recarga nginx si ha cambiado el directorio de vhosts de Herd.
+# Lo invoca launchd (StartInterval) en la sesión de $HERD_USER.
+# Guarda la marca de tiempo del directorio y sólo recarga si ha cambiado.
+NGINX_DIR="$HERD_HOME/config/valet/Nginx"
+PIDFILE="$HERD_HOME/bin/nginx.pid"
+STAMP="\${HOME}/Library/Caches/herd-reload.stamp"
+LOG="\${HOME}/Library/Logs/herd-multiusuario.log"
+# el CLI de Herd necesita php en el PATH (launchd sólo da /usr/bin:/bin:...)
+export PATH="/Users/$HERD_USER/Library/Application Support/Herd/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+mkdir -p "\$(dirname "\$STAMP")" "\$(dirname "\$LOG")" 2>/dev/null
+log() { printf '%s %s\n' "\$(date '+%F %T')" "\$1" >> "\$LOG"; }
+current=\$(stat -f '%m' "\$NGINX_DIR" 2>/dev/null)
+[ -z "\$current" ] && exit 0
+previous=\$(cat "\$STAMP" 2>/dev/null)
+[ "\$current" = "\$previous" ] && exit 0
+printf '%s' "\$current" > "\$STAMP" 2>/dev/null
+log "cambio detectado (\$current); recargando nginx"
+out=\$(HOME="/Users/$HERD_USER" "$HERD_HOME/bin/herd" restart nginx 2>&1)
+log "herd restart nginx: \$(printf '%s' "\$out" | tr '\n' ' ')"
+# recarga (con reintentos si nginx no queda en pie)
+for i in 1 2 3; do
+  sleep 1
+  pid=\$(cat "\$PIDFILE" 2>/dev/null)
+  # el master corre como root: no se puede usar kill -0, se mira con ps
+  if [ -n "\$pid" ] && ps -p "\$pid" >/dev/null 2>&1; then
+    log "nginx en pie (pid \$pid)"
+    exit 0
+  fi
+  HOME="/Users/$HERD_USER" "$HERD_HOME/bin/herd" restart nginx >/dev/null 2>&1
+done
+log "nginx NO responde"
+exit 0
+EOF
+  chmod 755 "$LIBEXEC/herd-site-reload"
+
+  mkdir -p "/Users/$HERD_USER/Library/LaunchAgents"
+  cat > "$LAUNCH_AGENT" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.herd.multiusuario.reload</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$LIBEXEC/herd-site-reload</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>10</integer>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
+EOF
+  chmod 644 "$LAUNCH_AGENT"
+  launchctl bootout "gui/$(id -u $HERD_USER)/com.herd.multiusuario.reload" 2>/dev/null
+  launchctl bootstrap "gui/$(id -u $HERD_USER)" "$LAUNCH_AGENT" 2>/dev/null \
+    || launchctl load "$LAUNCH_AGENT" 2>/dev/null
+  say "LaunchAgent: $LAUNCH_AGENT"
+}
+
+prepare_herd_dirs() {
+  step "Permisos de los directorios de Herd"
+  # Sites y Nginx los escribe el núcleo privilegiado (root vía sudo) o el
+  # dueño del Herd. NO los dejamos group-writable: cualquier usuario del
+  # grupo staff podría escribir un vhost que exponga ficheros privados.
+  for d in "$HERD_HOME/config/valet/Sites" "$HERD_HOME/config/valet/Nginx"; do
+    [ -d "$d" ] || continue
+    chmod 755 "$d"
+    say "$(basename "$d"): $(stat -f '%Sp %Su:%Sg' "$d")"
+  done
+}
+
+root_part() {
+  step "Regla sudoers"
+  "$LIBEXEC/herd-site-core" --install-sudoers || die "no se pudo instalar la regla sudoers"
+
+  step "Reparar el control de nginx"
+  # El helper de Herd guarda el pid del master en .pid/nginx.pid. Si ese pid
+  # está obsoleto (p.ej. porque el master se relanzó por otra vía) sus
+  # "restart" no hacen nada: avisa "Nginx has been restarted" y no recarga.
+  real_pid=$(cat "$HERD_HOME/bin/nginx.pid" 2>/dev/null)
+  helper_pid=$(cat "$HERD_HOME/.pid/nginx.pid" 2>/dev/null)
+  if [ -n "$real_pid" ] && [ "$real_pid" != "$helper_pid" ]; then
+    say "pid del helper obsoleto ($helper_pid) != master real ($real_pid): reparando"
+    kill -QUIT "$real_pid" 2>/dev/null
+    sleep 2
+    rm -f "$HERD_HOME/.pid/nginx.pid"
+  else
+    say "pid del helper y master coherentes ($real_pid)"
+  fi
+  # relanzar nginx con el helper (como agentmaster, que es quien tiene Herd)
+  if [ -z "$(cat "$HERD_HOME/bin/nginx.pid" 2>/dev/null)" ] || \
+     ! kill -0 "$(cat "$HERD_HOME/bin/nginx.pid" 2>/dev/null)" 2>/dev/null; then
+    su - agentmaster -c "/Users/agentmaster/Library/Application Support/Herd/bin/herd start" >/dev/null 2>&1
+    say "nginx relanzado"
+  fi
+  say "nginx master: $(cat "$HERD_HOME/bin/nginx.pid" 2>/dev/null)"
+
+  step "Herramientas en /usr/local/bin"
+  # /usr/local/bin está en el PATH por defecto de cualquier shell (login o no).
+  mkdir -p /usr/local/bin
+  for t in herd-site php74 php83 php84 php85 composer74 composer83 composer84 composer85 herd-composer; do
+    [ -e "$BIN/$t" ] || continue
+    ln -sf "$BIN/$t" "/usr/local/bin/$t"
+    say "/usr/local/bin/$t -> $BIN/$t"
+  done
+
+  step "Permisos de los logs de Herd"
+  # para que el dueño de Herd pueda validar la config con `nginx -t`
+  for f in "$HERD_HOME/Log/nginx-error.log" "$HERD_HOME/Log/php-fpm.log"; do
+    [ -f "$f" ] && chmod 664 "$f" 2>/dev/null && say "$(basename "$f"): $(stat -f '%Sp %Su:%Sg' "$f")"
+  done
+
+  step "Firewall"
+  if /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null | grep -q "enabled"; then
+    say "El firewall de macOS está activo."
+    /usr/libexec/ApplicationFirewall/socketfilterfw --add /Applications/Herd.app/Contents/Resources/nginx-arm64 2>/dev/null \
+      && say "nginx permitido (entrada)" \
+      || say "no se pudo añadir la excepción; añádela manualmente en Ajustes del Sistema"
+  else
+    say "El firewall de macOS está desactivado: no hace falta excepción."
+  fi
+
+  step "Confianza HTTPS"
+  say "La CA de Herd (Laravel Valet CA) ya está en el keychain del Sistema:"
+  security find-certificate -a -c "Laravel Valet CA" /Library/Keychains/System.keychain 2>/dev/null \
+    | grep -c "keychain:" | sed 's/^/  certificados encontrados: /'
+}
+
+if [ "${1:-}" = "--root" ]; then
+  [ "$(id -u)" = "0" ] || die "esta parte necesita sudo"
+  root_part
+  printf '\nListo.\n'
+  exit 0
+fi
+
+write_config
+install_shared_php
+install_wrappers
+install_launch_agent
+prepare_herd_dirs
+
+printf '\n== Comprobación\n'
+"$BIN/php74" -v 2>/dev/null | head -1 | sed 's/^/  /'
+"$BIN/php84" -v 2>/dev/null | head -1 | sed 's/^/  /'
+"$BIN/herd-site" versions 2>/dev/null | sed 's/^/  /'
+
+printf '\nPendiente de root (una sola vez):\n'
+printf '  sudo %s --root\n\n' "$LIBEXEC/herd-shared-setup"

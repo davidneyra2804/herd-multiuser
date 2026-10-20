@@ -1,0 +1,12 @@
+# Runtime compartido, certificados y manifiesto: no se versionan
+share/herd-shared/
+
+# Nada de claves privadas ni certificados en el repo
+*.pem
+*.key
+*.crt
+*.p12
+*.csr
+
+# macOS
+.DS_Store
