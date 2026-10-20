@@ -5,7 +5,9 @@ usar para publicar sus proyectos, igual que hace Herd pero sin tener que
 instalar Herd en cada cuenta.
 
 - Dueño del stack: el usuario dueño de Herd (Herd en `/Applications/Herd.app`)
-- Dominio: `*.backend.test` (resuelto a 127.0.0.1 por dnsmasq + `/etc/resolver/test`)
+- Dominio: `*.<tld>` — el que tenga configurado Herd (`herd tld`; por
+  defecto `.test`). Este setup lo lee de la configuración de Herd, así que
+  no hay que tocar nada. Se resuelve a 127.0.0.1 por dnsmasq + `/etc/resolver/test`
 - Versiones de PHP servidas: 7.4, 8.3, 8.4, 8.5 (una por proyecto, vía `herd.yml`)
 
 ---
@@ -14,7 +16,7 @@ instalar Herd en cada cuenta.
 
 ```bash
 cd ~/proyectos/mi-app
-herd-site link .            # publica https://<usuario>-mi-app.backend.test
+herd-site link .            # publica https://<usuario>-mi-app.<tld>
 herd-site link . --php 8.3  # fuerza la versión de PHP
 herd-site link . --https    # fuerza HTTPS
 herd-site list              # ver todos los sitios
@@ -51,10 +53,10 @@ así que se ven desde otros equipos:
 
 ```bash
 ipconfig getifaddr en0        # IP del Mac
-curl -H "Host: mi-app.backend.test" http://192.168.18.200/
+curl -H "Host: mi-app.<tld>" http://192.168.18.200/
 ```
 
-El certificado es comodín (`*.backend.test`) y está firmado por la CA de Herd
+El certificado es comodín (`*.<tld>`) y está firmado por la CA de Herd
 (*Laravel Valet CA*), que ya está en el **keychain del Sistema** → lo confían
 todos los usuarios del Mac, sin avisos del navegador.
 
@@ -68,7 +70,7 @@ todos los usuarios del Mac, sin avisos del navegador.
 | php-fpm | `~/Library/Application Support/Herd/config/fpm/*.conf` | un pool por versión, `user=dueño group=staff`, socket `herdXX.sock` |
 | DNS | dnsmasq + `/etc/resolver/test` | `*.test` → 127.0.0.1 para todo el Mac |
 | Registro de sitios | `.../config/valet/Sites/<nombre>` | symlink al directorio del proyecto |
-| vhosts | `.../config/valet/Nginx/<nombre>.backend.test` | los genera `herd-site-core` |
+| vhosts | `.../config/valet/Nginx/<nombre>.<tld>` | los genera `herd-site-core` |
 | CLI | `/opt/homebrew/bin/herd-site` | publica/quita sitios (valida y llama al núcleo) |
 | Núcleo | `/opt/homebrew/libexec/herd-site-core` | lo ejecuta root vía sudo (regla en `/etc/sudoers.d/herd-site`) |
 | Runtime PHP | `/opt/homebrew/share/herd-shared/php/<ver>/` | copias de los binarios de Herd, legibles por todos |
@@ -114,7 +116,7 @@ herd-site selftest
 
 # 2. Publicar su proyecto
 cd ~/projects/mi-app
-herd-site link .                 # → https://alice-mi-app.backend.test
+herd-site link .                 # → https://alice-mi-app.<tld>
 ```
 
 `herd-site link` lee el `herd.yml` del proyecto:
@@ -124,7 +126,7 @@ php: '7.4'        # versión de PHP con la que se sirve
 secured: true     # publica por HTTPS
 ```
 
-Y a partir de ahí, la web está en `https://alice-mi-app.backend.test`
+Y a partir de ahí, la web está en `https://alice-mi-app.<tld>`
 (tanto desde el Mac como desde la LAN) y el proyecto se sirve con el PHP que
 pida su `herd.yml`.
 
@@ -139,7 +141,7 @@ pida su `herd.yml`.
 | `herd links` | `herd-site links` (sólo los del usuario; `--all` para ver todo) |
 | `herd unlink` | `herd-site unlink <host>` |
 | `herd list` | `herd-site list` |
-| `herd secure` | `herd-site link . --https` (cert comodín `*.backend.test`) |
+| `herd secure` | `herd-site link . --https` (cert comodín `*.<tld>`) |
 | `herd park` | no aplica (el registro es por proyecto) |
 
 `herd-site link` hace en un solo paso lo que en Herd son dos (link + isolate),

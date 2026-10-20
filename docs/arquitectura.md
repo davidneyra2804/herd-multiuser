@@ -9,9 +9,9 @@ problemas que hubo que resolver (que son los que volverían a aparecer).
 |---|---|---|
 | nginx | `/Applications/Herd.app/Contents/Resources/nginx-arm64` | el **master** corre como root vía el helper privilegiado `de.beyondco.herd.helper`; los workers como el usuario dueño de Herd (`user "el-owner" staff;`) |
 | php-fpm | `$HERD_HOME/config/fpm/<ver>-fpm.conf` | un pool por versión, `user=dueño`, `group=staff`, socket `$HERD_HOME/herd<ver>.sock`, `listen.mode=0777` |
-| DNS | dnsmasq + `/etc/resolver/test` | `address=/.test/127.0.0.1` → `*.backend.test` ya resolvía a 127.0.0.1 **para todo el Mac** |
+| DNS | dnsmasq + `/etc/resolver/test` | `address=/.test/127.0.0.1` → `*.<tld>` ya resolvía a 127.0.0.1 **para todo el Mac** |
 | registro de sitios | `$HERD_HOME/config/valet/Sites/<nombre>` | symlink al directorio del proyecto |
-| vhosts | `$HERD_HOME/config/valet/Nginx/<nombre>.backend.test` | el `nginx.conf` hace `include ".../config/valet/Nginx/*"` → cualquier fichero de ahí es un vhost |
+| vhosts | `$HERD_HOME/config/valet/Nginx/<nombre>.<tld>` | el `nginx.conf` hace `include ".../config/valet/Nginx/*"` → cualquier fichero de ahí es un vhost |
 | plantilla de vhost | `valet/cli/stubs/site.valet.conf` | el núcleo la replica |
 | CA de TLS | `$HERD_HOME/config/valet/CA/` | "Laravel Valet CA", **ya está en el keychain del Sistema** → la confían todos los usuarios |
 

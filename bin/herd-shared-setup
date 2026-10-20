@@ -20,12 +20,27 @@ SHARED="${SHARED:-/opt/homebrew/share/herd-shared}"
 [ -f "$SHARED/config.env" ] && . "$SHARED/config.env" 2>/dev/null
 HERD_USER="${HERD_USER:-$(id -un)}"
 HERD_HOME="${HERD_HOME:-/Users/$HERD_USER/Library/Application Support/Herd}"
+
 SHARED="/opt/homebrew/share/herd-shared"
 SHARED_PHP="$SHARED/php"
 BIN="/opt/homebrew/bin"
 LIBEXEC="/opt/homebrew/libexec"
-TLD="backend.test"
 LAUNCH_AGENT="/Users/$HERD_USER/Library/LaunchAgents/com.herd.multiusuario.reload.plist"
+
+# El TLD es el que tenga configurado Herd (`herd tld`): no es fijo, cada
+# equipo puede usar el suyo (.test es el estándar de Herd).
+herd_tld() {
+  local t=""
+  if [ -f "$HERD_HOME/config/valet/config.json" ]; then
+    t=$(grep -o '"tld"[[:space:]]*:[[:space:]]*"[^"]*"' "$HERD_HOME/config/valet/config.json" 2>/dev/null \
+         | head -1 | sed -E 's/.*"([^"]*)"$/\1/')
+  fi
+  [ -n "$t" ] && { printf '%s' "$t"; return 0; }
+  printf '%s' "${TLD:-test}"
+}
+
+# el TLD real del Herd del host (config.json de Herd; .test es el estándar)
+TLD="$(herd_tld)"
 
 say()  { printf '  %s\n' "$1"; }
 step() { printf '\n== %s\n' "$1"; }
@@ -54,7 +69,7 @@ write_config() {
 # Configuración del Herd compartido. Lo genera el instalador.
 HERD_USER="$HERD_USER"
 HERD_HOME="$HERD_HOME"
-TLD="${TLD:-backend.test}"
+TLD="$TLD"
 GROUP="${GROUP:-staff}"
 EOF
   chmod 644 "$SHARED/config.env"

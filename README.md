@@ -16,11 +16,15 @@ Este proyecto resuelve las dos cosas:
 ```console
 $ cd ~/proyectos/mi-app
 $ herd-site link .
-  sitio: alice-mi-app.backend.test   php: 7.4   https: 0
-  URL   http://alice-mi-app.backend.test
+  sitio: alice-mi-app.<tld>   php: 7.4   https: 0
+  URL   http://alice-mi-app.<tld>
 ```
 
-Y ya está: `http://alice-mi-app.backend.test` funciona en el Mac y en la LAN.
+Y ya está: `http://alice-mi-app.<tld>` funciona en el Mac y en la LAN.
+
+> **`<tld>`** es el dominio que tenga configurado Herd en ese Mac
+> (`herd tld`; por defecto `.test`). Este proyecto lo lee de la configuración
+> de Herd, así que cada equipo usa el suyo sin tocar nada.
 
 ---
 
@@ -47,7 +51,7 @@ Además, cosas que Herd no tiene porque en un Mac multiusuario hacen falta:
   lo borra.
 - **Nombres con prefijo de usuario** (`alice-mi-app`) para que nadie pise el
   sitio de otro.
-- **Certificado comodín** `*.backend.test` firmado por la CA de Herd, que ya
+- **Certificado comodín** `*.<tld>` firmado por la CA de Herd, que ya
   está en el keychain del Sistema → **todos los usuarios confían en él** sin
   avisos del navegador.
 - **Acceso desde la LAN** (listeners en `0.0.0.0`), no sólo desde el Mac.
@@ -147,7 +151,7 @@ herd-site selftest       # prueba de extremo a extremo
   sus workers como el usuario dueño de Herd, en el grupo `staff`.
 - El **php-fpm** de cada versión de PHP está en un pool con
   `user=dueño`, `group=staff`.
-- El **DNS** ya resolvía `*.backend.test` → `127.0.0.1` para todo el Mac
+- El **DNS** ya resolvía `*.<tld>` → `127.0.0.1` para todo el Mac
   (dnsmasq + `/etc/resolver/test`).
 - El **registro de sitios** de Herd son symlinks en
   `~/Library/Application Support/Herd/config/valet/Sites/`.

@@ -34,19 +34,36 @@ SITES_DIR="$HERD_HOME/config/valet/Sites"
 NGINX_DIR="$HERD_HOME/config/valet/Nginx"
 SHARED="/opt/homebrew/share/herd-shared"
 SHARED_PHP="$SHARED/php"
-TLD="backend.test"
+TLD="${TLD:-test}"
 CORE="${CORE:-/opt/homebrew/libexec/herd-site-core}"
 MANIFEST="$SHARED/sites.tsv"
 SHARED_PHP="$SHARED/php"
 COMPOSER_PHAR="${COMPOSER_PHAR:-/opt/homebrew/bin/composer.phar}"
 
+# El TLD es el que tenga configurado Herd (`herd tld`): no es fijo, cada
+# equipo puede usar el suyo (.test es el estándar de Herd).
+herd_tld() {
+  local t=""
+  if [ -f "$HERD_HOME/config/valet/config.json" ]; then
+    t=$(grep -o '"tld"[[:space:]]*:[[:space:]]*"[^"]*"' "$HERD_HOME/config/valet/config.json" 2>/dev/null \
+         | head -1 | sed -E 's/.*"([^"]*)"$/\1/')
+  fi
+  [ -n "$t" ] && { printf '%s' "$t"; return 0; }
+  printf '%s' "${TLD:-test}"
+}
+
 die() { printf 'herd-site: %s\n' "$1" >&2; exit "${2:-1}"; }
+
+# el TLD real del Herd del host (config.env > config.json de Herd > .test)
+TLD="$(herd_tld)"
 say() { printf '%s\n' "$1"; }
 hint() { printf '  → %s\n' "$1"; }
 
 usage() {
   sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
 }
+
+
 
 # ---------------------------------------------------------------- utilidades
 
