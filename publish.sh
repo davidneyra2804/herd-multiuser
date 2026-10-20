@@ -40,7 +40,7 @@ step "Repositorio"
 if gh repo view "$ACCOUNT/$NAME" >/dev/null 2>&1; then
   say "$ACCOUNT/$NAME ya existe"
 else
-  gh repo create "$ACCOUNT/$NAME" --"$VISIBILITY" --source=. --remote=origin --push \
+  gh repo create "$ACCOUNT/$NAME" --"$VISIBILITY" --source=. --push \
     --description "Herd compartido multiusuario para macOS: un solo Herd (nginx + php-fpm) que todos los usuarios del Mac pueden usar para publicar sus proyectos" \
     && say "creado $ACCOUNT/$NAME ($VISIBILITY)" \
     || die "no se pudo crear el repositorio"

@@ -191,6 +191,10 @@ modelo de seguridad…) está en **[docs/arquitectura.md](docs/arquitectura.md)*
 - **[docs/arquitectura.md](docs/arquitectura.md)** — diseño, permisos,
   seguridad y problemas resueltos.
 
+## Licencia
+
+MIT — ver [LICENSE](LICENSE).
+
 ## Desinstalar
 
 ```bash
