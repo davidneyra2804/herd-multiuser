@@ -242,6 +242,26 @@ prepare_herd_dirs() {
   done
 }
 
+ensure_nginx_up() {
+  # si el master de nginx no está en pie, se levanta (lo gestiona el helper)
+  if pgrep -f "nginx: master process" >/dev/null 2>&1; then
+    say "nginx en marcha (pid $(cat "$HERD_HOME/bin/nginx.pid" 2>/dev/null))"
+    return 0
+  fi
+  say "nginx no está en marcha: se arranca"
+  "$HERD_HOME/bin/herd" start >/dev/null 2>&1
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.5
+    pgrep -f "nginx: master process" >/dev/null 2>&1 && {
+      say "nginx arrancado (pid $(cat "$HERD_HOME/bin/nginx.pid" 2>/dev/null))"
+      return 0
+    }
+  done
+  say "AVISO: nginx no arrancó; revisa la app de Herd"
+  return 1
+}
+
 root_part() {
   step "Regla sudoers"
   "$LIBEXEC/herd-site-core" --install-sudoers || die "no se pudo instalar la regla sudoers"
@@ -311,6 +331,7 @@ install_shared_php
 install_wrappers
 install_launch_agent
 prepare_herd_dirs
+ensure_nginx_up
 
 printf '\n== Comprobación\n'
 "$BIN/php74" -v 2>/dev/null | head -1 | sed 's/^/  /'

@@ -10,8 +10,14 @@
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HERD_USER="$(id -un)"
-HERD_HOME="$HOME/Library/Application Support/Herd"
+
+# si se ejecuta con sudo, el "dueño de Herd" es el usuario que lo invocó
+if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
+  HERD_USER="$SUDO_USER"
+else
+  HERD_USER="$(id -un)"
+fi
+HERD_HOME="${HERD_HOME:-/Users/$HERD_USER/Library/Application Support/Herd}"
 
 say()  { printf '  %s\n' "$1"; }
 step() { printf '\n== %s\n' "$1"; }
@@ -22,9 +28,10 @@ die()  { printf 'error: %s\n' "$1" >&2; exit 1; }
 if [ "${1:-}" = "--root" ]; then
   [ "$(id -u)" = "0" ] || die "esta parte necesita sudo"
   command -v brew >/dev/null 2>&1 || die "no encuentro Homebrew"
-  LIBEXEC="$(brew --prefix)/libexec"
+  # brew puede no estar en el PATH de root
+  BREW_PREFIX="$(sudo -u "$HERD_USER" -H brew --prefix 2>/dev/null || echo /opt/homebrew)"
+  LIBEXEC="$BREW_PREFIX/libexec"
   [ -x "$LIBEXEC/herd-shared-setup" ] || die "no está instalado $LIBEXEC/herd-shared-setup (ejecuta antes ./install.sh)"
-  export HERD_USER HERD_HOME
   su - "$HERD_USER" -c "HERD_USER='$HERD_USER' HERD_HOME='$HERD_HOME' '$LIBEXEC/herd-shared-setup' --root"
   exit $?
 fi
