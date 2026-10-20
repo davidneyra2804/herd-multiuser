@@ -4,7 +4,7 @@ Un único stack web (nginx + php-fpm) que **todos los usuarios del Mac** pueden
 usar para publicar sus proyectos, igual que hace Herd pero sin tener que
 instalar Herd en cada cuenta.
 
-- Dueño del stack: `agentmaster` (Herd 1.30.2 en `/Applications/Herd.app`)
+- Dueño del stack: el usuario dueño de Herd (Herd en `/Applications/Herd.app`)
 - Dominio: `*.backend.test` (resuelto a 127.0.0.1 por dnsmasq + `/etc/resolver/test`)
 - Versiones de PHP servidas: 7.4, 8.3, 8.4, 8.5 (una por proyecto, vía `herd.yml`)
 
@@ -21,7 +21,7 @@ herd-site list              # ver todos los sitios
 herd-site unlink mi-app     # quitar un sitio
 ```
 
-El nombre por defecto lleva el prefijo del usuario (`vyrglobal-mi-app`) para que
+El nombre por defecto lleva el prefijo del usuario (`alice-mi-app`) para que
 dos personas no colisionen. Se puede forzar con `--name` o desactivar con
 `--no-namespace`.
 
@@ -64,8 +64,8 @@ todos los usuarios del Mac, sin avisos del navegador.
 
 | Pieza | Dónde | Qué hace |
 |---|---|---|
-| nginx | `/Applications/Herd.app/.../nginx-arm64` | master como **root** (helper `de.beyondco.herd.helper`), workers como `agentmaster` |
-| php-fpm | `~/Library/Application Support/Herd/config/fpm/*.conf` | un pool por versión, `user=agentmaster group=staff`, socket `herdXX.sock` |
+| nginx | `/Applications/Herd.app/.../nginx-arm64` | master como **root** (helper `de.beyondco.herd.helper`), workers como el usuario dueño de Herd |
+| php-fpm | `~/Library/Application Support/Herd/config/fpm/*.conf` | un pool por versión, `user=dueño group=staff`, socket `herdXX.sock` |
 | DNS | dnsmasq + `/etc/resolver/test` | `*.test` → 127.0.0.1 para todo el Mac |
 | Registro de sitios | `.../config/valet/Sites/<nombre>` | symlink al directorio del proyecto |
 | vhosts | `.../config/valet/Nginx/<nombre>.backend.test` | los genera `herd-site-core` |
@@ -76,7 +76,7 @@ todos los usuarios del Mac, sin avisos del navegador.
 
 ### Modelo de permisos
 
-- nginx y php-fpm corren como `agentmaster:staff`; por eso **todo** proyecto
+- nginx y php-fpm corren como `dueño:staff`; por eso **todo** proyecto
   publicado necesita ser legible por el grupo `staff`.
 - `herd-site` deja el proyecto en grupo `staff`, con `g+rX` en todo el árbol y
   `g+rwX` en `storage/`, `bootstrap/cache/`, `public/build/` y `var/logs/`
@@ -98,7 +98,7 @@ tiene permiso de escritura.
 ## Instalación / reparación
 
 ```bash
-# parte de agentmaster (sin sudo): runtime PHP, wrappers, LaunchAgent
+# parte de el-owner (sin sudo): runtime PHP, wrappers, LaunchAgent
 $PREFIX/libexec/herd-shared-setup
 
 # parte de root (una vez): sudoers, /usr/local/bin, logs, firewall
@@ -106,7 +106,7 @@ $PREFIX/libexec/herd-shared-setup
 sudo $PREFIX/libexec/herd-shared-setup --root
 ```
 
-## Primeros pasos para un usuario nuevo (ej. vyrglobal)
+## Primeros pasos para un usuario nuevo (ej. `alice`)
 
 ```bash
 # 1. Comprobar que todo está en su sitio (publica un proyecto de prueba y lo borra)
@@ -114,7 +114,7 @@ herd-site selftest
 
 # 2. Publicar su proyecto
 cd ~/projects/mi-app
-herd-site link .                 # → https://vyrglobal-mi-app.backend.test
+herd-site link .                 # → https://alice-mi-app.backend.test
 ```
 
 `herd-site link` lee el `herd.yml` del proyecto:
@@ -124,7 +124,7 @@ php: '7.4'        # versión de PHP con la que se sirve
 secured: true     # publica por HTTPS
 ```
 
-Y a partir de ahí, la web está en `https://vyrglobal-mi-app.backend.test`
+Y a partir de ahí, la web está en `https://alice-mi-app.backend.test`
 (tanto desde el Mac como desde la LAN) y el proyecto se sirve con el PHP que
 pida su `herd.yml`.
 
@@ -156,7 +156,7 @@ y republicar con `--php` cambia la versión en caliente (verificado: 7.4 → 8.3
 4. Si no, la versión por defecto de Herd.
 
 ```bash
-cd ~/projects/php_gts_api
+cd ~/proyectos/mi-app
 herd-site php --version        # PHP 7.4.33
 herd-site composer install     # composer con PHP 7.4
 herd-site php artisan migrate  # artisan con PHP 7.4
@@ -170,7 +170,7 @@ herd-site links --all            # los de todo el Mac, con su dueño
 herd-site list                   # todos los sitios (vista global)
 herd-site doctor                 # auditoría: listeners, UUID, versión, fpm, cert
 herd-site reapply                # regenera los vhosts (tras actualizar Herd)
-herd-site unlink vyrglobal-mi-app # quitar un sitio
+herd-site unlink alice-mi-app # quitar un sitio
 herd-site prune                  # limpia del manifiesto los sitios borrados
 ```
 
@@ -226,7 +226,7 @@ sus URLs no cambian.
 - `herd link` (el CLI de Herd) sigue funcionando, pero crea vhosts que sólo
   escuchan en `127.0.0.1`. Para que se vean desde la LAN, republica con
   `herd-site`.
-- El stack depende de que `agentmaster` tenga sesión iniciada (Herd.app es lo
+- El stack depende de que el usuario dueño de Herd tenga sesión iniciada (Herd.app es lo
   que mantiene vivos los php-fpm).
 - `herd-site` arranca el `php-fpm` de la versión pedida si no estaba en marcha
   (si no, la web responde 502).

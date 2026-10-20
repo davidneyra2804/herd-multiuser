@@ -7,8 +7,8 @@ problemas que hubo que resolver (que son los que volverían a aparecer).
 
 | Pieza | Dónde | Nota |
 |---|---|---|
-| nginx | `/Applications/Herd.app/Contents/Resources/nginx-arm64` | el **master** corre como root vía el helper privilegiado `de.beyondco.herd.helper`; los workers como el usuario dueño de Herd (`user "agentmaster" staff;`) |
-| php-fpm | `$HERD_HOME/config/fpm/<ver>-fpm.conf` | un pool por versión, `user=agentmaster`, `group=staff`, socket `$HERD_HOME/herd<ver>.sock`, `listen.mode=0777` |
+| nginx | `/Applications/Herd.app/Contents/Resources/nginx-arm64` | el **master** corre como root vía el helper privilegiado `de.beyondco.herd.helper`; los workers como el usuario dueño de Herd (`user "el-owner" staff;`) |
+| php-fpm | `$HERD_HOME/config/fpm/<ver>-fpm.conf` | un pool por versión, `user=dueño`, `group=staff`, socket `$HERD_HOME/herd<ver>.sock`, `listen.mode=0777` |
 | DNS | dnsmasq + `/etc/resolver/test` | `address=/.test/127.0.0.1` → `*.backend.test` ya resolvía a 127.0.0.1 **para todo el Mac** |
 | registro de sitios | `$HERD_HOME/config/valet/Sites/<nombre>` | symlink al directorio del proyecto |
 | vhosts | `$HERD_HOME/config/valet/Nginx/<nombre>.backend.test` | el `nginx.conf` hace `include ".../config/valet/Nginx/*"` → cualquier fichero de ahí es un vhost |

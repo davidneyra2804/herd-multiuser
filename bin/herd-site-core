@@ -153,7 +153,7 @@ apply_permissions() {  # $1 = raíz del proyecto
   if [ "$(stat -f '%Sg' "$root" 2>/dev/null)" != "$GROUP" ]; then
     chgrp -R "$GROUP" "$root" 2>/dev/null
   fi
-  # lectura: nginx (agentmaster:staff) y php-fpm necesitan leer el código
+  # lectura: nginx (dueño:staff) y php-fpm necesitan leer el código
   find "$root" -type d ! -perm -g+x -exec chmod g+x {} + 2>/dev/null
   find "$root" -type f ! -perm -g+r -exec chmod g+r {} + 2>/dev/null
   # escritura: la app escribe en storage/, bootstrap/cache/, etc.

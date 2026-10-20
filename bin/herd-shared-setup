@@ -1,13 +1,13 @@
 #!/bin/bash
 # herd-shared-setup — deja el Mac con un Herd compartido por todos los usuarios.
 #
-#   /opt/homebrew/libexec/herd-shared-setup            -> parte de agentmaster (sin sudo)
+#   <prefix>/libexec/herd-shared-setup                   -> parte del usuario (sin sudo)
 #   sudo /opt/homebrew/libexec/herd-shared-setup --root -> parte de root (sudoers, firewall)
 #
 # Lo que instala la parte sin sudo:
 #   /opt/homebrew/share/herd-shared/php/<ver>/{php,php-fpm,php.ini}
 #   /opt/homebrew/bin/php74 php83 php84 php85 php composer
-#   /Users/agentmaster/Library/LaunchAgents/com.herd.multiusuario.reload.plist
+#   ~/Library/LaunchAgents/com.herd.multiusuario.reload.plist
 #
 # Lo que instala la parte con sudo:
 #   /etc/sudoers.d/herd-site   (publicar/quitar sitios sin contraseña)
@@ -280,10 +280,10 @@ root_part() {
   else
     say "pid del helper y master coherentes ($real_pid)"
   fi
-  # relanzar nginx con el helper (como agentmaster, que es quien tiene Herd)
+  # relanzar nginx con el helper (como el usuario dueño de Herd)
   if [ -z "$(cat "$HERD_HOME/bin/nginx.pid" 2>/dev/null)" ] || \
      ! kill -0 "$(cat "$HERD_HOME/bin/nginx.pid" 2>/dev/null)" 2>/dev/null; then
-    su - agentmaster -c "/Users/agentmaster/Library/Application Support/Herd/bin/herd start" >/dev/null 2>&1
+    su - "$HERD_USER" -c "HOME='$HERD_HOME/..' '$HERD_HOME/bin/herd' start" >/dev/null 2>&1
     say "nginx relanzado"
   fi
   say "nginx master: $(cat "$HERD_HOME/bin/nginx.pid" 2>/dev/null)"

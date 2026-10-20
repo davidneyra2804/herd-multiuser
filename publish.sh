@@ -1,15 +1,25 @@
 #!/bin/bash
-# publish.sh — publica este repo en tu cuenta personal de GitHub.
+# publish.sh — publica este repo en tu cuenta de GitHub.
 #
-#   ./publish.sh [cuenta]      (por defecto: la cuenta activa de `gh`)
+#   ./publish.sh [cuenta] [--public]
 #
+# Por defecto crea el repositorio en privado; con --public, público.
 # Necesitas haber hecho `gh auth login` con esa cuenta antes.
-# El repo se crea en privado y se hace push de la rama actual.
+# El push se hace con la clave SSH de la cuenta (alias en ~/.ssh/config).
 
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ACCOUNT="${1:-$(gh api user -q .login 2>/dev/null)}"
+VISIBILITY="private"
+ACCOUNT=""
+for a in "$@"; do
+  case "$a" in
+    --public) VISIBILITY="public" ;;
+    --private) VISIBILITY="private" ;;
+    *) ACCOUNT="$a" ;;
+  esac
+done
+[ -n "$ACCOUNT" ] || ACCOUNT="$(gh api user -q .login 2>/dev/null)"
 NAME="$(basename "$REPO_DIR")"
 KEY_ALIAS="github-personal"
 
@@ -30,9 +40,9 @@ step "Repositorio"
 if gh repo view "$ACCOUNT/$NAME" >/dev/null 2>&1; then
   say "$ACCOUNT/$NAME ya existe"
 else
-  gh repo create "$ACCOUNT/$NAME" --private --source=. --remote=origin --push \
-    --description "Herd compartido multiusuario para macOS" \
-    && say "creado $ACCOUNT/$NAME" \
+  gh repo create "$ACCOUNT/$NAME" --"$VISIBILITY" --source=. --remote=origin --push \
+    --description "Herd compartido multiusuario para macOS: un solo Herd (nginx + php-fpm) que todos los usuarios del Mac pueden usar para publicar sus proyectos" \
+    && say "creado $ACCOUNT/$NAME ($VISIBILITY)" \
     || die "no se pudo crear el repositorio"
 fi
 

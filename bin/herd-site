@@ -151,7 +151,7 @@ installed_php() {
 }
 
 sudo_core() {
-  # El dueño del Herd (agentmaster) opera sin sudo; el resto usa la regla
+  # El dueño del Herd opera sin sudo; el resto usa la regla
   # sudoers que instala `herd-shared-setup --root`.
   if [ "$(id -un)" = "$HERD_USER" ]; then
     "$CORE" "$@"
@@ -249,7 +249,7 @@ cmd_unlink() {
   sudo_core unlink --name "$name"
 }
 
-owner_from_path() {  # /Users/vyrglobal/x -> vyrglobal
+owner_from_path() {  # /Users/alice/proyectos/x -> alice
   case "$1" in
     /Users/*/*) printf '%s' "$1" | sed 's#^/Users/##' | cut -d/ -f1 ;;
     *) printf '%s' "-" ;;
